@@ -6,13 +6,19 @@ else ()
     project(${TOOL_NAME})
 endif ()
 
-set(SRC_FILE "${CMAKE_SOURCE_DIR}/include/logcat.h")
-add_custom_command(
-        OUTPUT "${SRC_FILE}"
-        COMMAND sed -i '' 's|".*"|"/data/adb/modules/${MODULE_DIR}/config"|g' "${SRC_FILE}"
-        COMMENT "Replacing strings in logcat.h with the config file path"
+if (NOT DEFINED MODULE_DIR)
+    message(FATAL_ERROR "MODULE_DIR is not set")
+endif ()
+
+# Generate logcat.h with correct config path (portable; no sed in-place edits).
+set(CONFIG_FILE_PATH "/data/adb/modules/${MODULE_DIR}/config")
+set(GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
+file(MAKE_DIRECTORY "${GENERATED_INCLUDE_DIR}")
+configure_file(
+        "${CMAKE_SOURCE_DIR}/include/logcat.h.in"
+        "${GENERATED_INCLUDE_DIR}/logcat.h"
+        @ONLY
 )
-add_custom_target(replace_config ALL DEPENDS "${SRC_FILE}")
 
 message("Build type: ${CMAKE_BUILD_TYPE}")
 
@@ -36,7 +42,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 add_executable(${TOOL_NAME} main.cpp logcat.cpp)
-add_dependencies(${TOOL_NAME} replace_config)
+target_include_directories(${TOOL_NAME} BEFORE PRIVATE "${GENERATED_INCLUDE_DIR}")
 target_link_libraries(${TOOL_NAME} log)
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")

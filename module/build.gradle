@@ -66,6 +66,18 @@ afterEvaluate {
                 filter(FixCrLfFilter.class,
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
+
+            // Include prebuilt frida/ajeossida gadget libraries in module root.
+            // Prefer $rootDir/gadget (user-managed), fall back to $rootDir/temp (reference).
+            duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+            ["$rootDir/gadget", "$rootDir/temp"].each { dir ->
+                if (file(dir).exists()) {
+                    from(dir) {
+                        include "*-gadget-*-android-*.so"
+                    }
+                }
+            }
+
             from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib") {
                 into 'lib'
             }
