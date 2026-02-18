@@ -23,9 +23,24 @@ Create `frida-gadget.config` file in the module directory (`/data/adb/modules/zy
 e.g., `/data/local/tmp/zygisk-gadget -p com.android.chrome -d 300000 -c`
 
 # Build and Flash
-Git clone this repo and open it in Android Studio.
+This project is a **pure NDK + CMake** build (no Gradle / no Java).
 
-Build and flash by "./gradlew :module:flashAndRebootRelease"
+## Build release zip
+- Install Android NDK and CMake.
+- Provide gadget libraries in `template/magisk_module/`:
+  - `ajeossida-gadget-16.5.2-android-arm.so`
+  - `ajeossida-gadget-16.5.2-android-arm64.so`
+  - `ajeossida-gadget-16.5.2-android-x86.so`
+  - `ajeossida-gadget-16.5.2-android-x86_64.so`
+
+Build:
+
+```bash
+./build.sh --ndk /path/to/android-ndk
+```
+
+Output:
+- `out/*-release.zip`
 
 # Credits
 [xDL](https://github.com/hexhacking/xDL)<br>

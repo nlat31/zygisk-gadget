@@ -1,0 +1,13 @@
+#ifndef ZYGISK_GADGET_LOGCAT_H
+#define ZYGISK_GADGET_LOGCAT_H
+
+#include <string>
+
+// This header is generated at configure time via CMake (tool/CMakeLists.txt).
+// Do not edit the generated file in build output; edit this template instead.
+const std::string config_file_path = "@CONFIG_FILE_PATH@";
+
+void logcat();
+
+#endif //ZYGISK_GADGET_LOGCAT_H
+
