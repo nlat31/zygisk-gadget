@@ -3,7 +3,7 @@
         "name":"com.hackcatml.test",
         "delay":300000,
         "mode":{
-            "config":false
+            "config":true
         }
     }
 }
