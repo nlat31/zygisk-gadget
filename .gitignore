@@ -8,5 +8,14 @@
 /build
 /captures
 /out
+/release
 /.externalNativeBuild
 /.cxx
+
+# Android/Gradle generated files
+.gradle/
+build/
+ui/.gradle/
+ui/build/
+ui/app/build/
+ui/app/release/

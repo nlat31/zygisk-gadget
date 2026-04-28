@@ -22,6 +22,19 @@ public class MainActivity extends AppCompatActivity {
 
         vm = new ViewModelProvider(this).get(SharedViewModel.class);
 
+        // Load persisted settings before ViewPager creates fragments so both
+        // tabs render the current module configuration on first display.
+        if (!RootShell.ensureRoot()) {
+            new AlertDialog.Builder(this)
+                .setTitle(R.string.app_name)
+                .setMessage(R.string.root_required)
+                .setPositiveButton(android.R.string.ok, null)
+                .show();
+        } else {
+            ConfigStore.Config cfg = ConfigStore.readConfigOrNull();
+            if (cfg != null) vm.loadFromConfig(cfg);
+        }
+
         ViewPager2 pager = findViewById(R.id.pager);
         TabLayout tabs = findViewById(R.id.tabs);
         ExtendedFloatingActionButton btnClear = findViewById(R.id.btnClear);
@@ -49,18 +62,6 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        // Request root early (shows Magisk prompt)
-        if (!RootShell.ensureRoot()) {
-            new AlertDialog.Builder(this)
-                .setTitle(R.string.app_name)
-                .setMessage(R.string.root_required)
-                .setPositiveButton(android.R.string.ok, null)
-                .show();
-        } else {
-            ConfigStore.Config cfg = ConfigStore.readConfigOrNull();
-            if (cfg != null) vm.loadFromConfig(cfg);
-        }
-
         btnApply.setOnClickListener(v -> {
             if (!RootShell.ensureRoot()) {
                 Toast.makeText(this, R.string.root_required, Toast.LENGTH_LONG).show();
@@ -70,8 +71,10 @@ public class MainActivity extends AppCompatActivity {
             ConfigStore.Config cfg = new ConfigStore.Config(
                 vm.selectedPackage,
                 vm.delayMicros,
+                vm.interactionMode,
                 vm.listenAddress,
-                vm.listenPort
+                vm.listenPort,
+                vm.scriptPath
             );
             RootShell.Result r = ConfigStore.writeConfig(cfg);
             if (r.code == 0) {
