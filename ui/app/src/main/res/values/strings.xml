@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FriGadgetUI</string>
+    <string name="tab_apps">Target App</string>
+    <string name="tab_options">Gadget Config</string>
+    <string name="apply">Apply</string>
+    <string name="clear_selection">Clear</string>
+    <string name="apps_tip">Select the target app that Zygisk Gadget should inject.</string>
+    <string name="show_system_apps">Show system apps</string>
+    <string name="options_tip">Configure Frida Gadget startup delay and listen endpoint.</string>
+    <string name="delay_micros">Delay (microseconds)</string>
+    <string name="listen_address">Listen address</string>
+    <string name="listen_port">Listen port</string>
+    <string name="root_required">Root permission is required to read/write /data/adb.</string>
+</resources>
+

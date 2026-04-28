@@ -15,12 +15,13 @@ Usage: ./zygisk-gadget -p <packageName> <option(s)>
 
 ## Normal mode
 Frida-gadget will be loaded when the target package is launched.<br>
-e.g., `/data/local/tmp/zygisk-gadget -p com.android.chrome -d 300000`
+Use `-d 0` when hooks must be installed before the first Activity lifecycle callbacks.<br>
+e.g., `/data/local/tmp/zygisk-gadget -p com.android.chrome -d 0`
 
 ## Config file mode
 This module supports a config file mode as described [here](https://frida.re/docs/gadget/)<br>
 Create `frida-gadget.config` file in the module directory (`/data/adb/modules/zygisk_gadget`) and then use `zygisk-gadget` tool with the config option<br>
-e.g., `/data/local/tmp/zygisk-gadget -p com.android.chrome -d 300000 -c`
+e.g., `/data/local/tmp/zygisk-gadget -p com.android.chrome -d 0 -c`
 
 # Build and Flash
 This project is a **pure NDK + CMake** build (no Gradle / no Java).

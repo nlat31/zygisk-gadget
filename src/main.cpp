@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdint>
+#include <ctime>
 
 #include "zygisk.hpp"
 #include "log.h"
@@ -101,10 +102,19 @@ static std::string normalize_dir(std::string p) {
     return p;
 }
 
+static long long monotonic_ms() {
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<long long>(ts.tv_sec) * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
 void injection_thread(const char* app_data_dir, const char* frida_gadget_name, uint time_to_sleep) {
-    LOGD("Frida-gadget injection thread start, app_data_dir: %s, gadget name: %s, usleep: %d",
-         app_data_dir, frida_gadget_name, time_to_sleep);
-    usleep(time_to_sleep);
+    LOGD("Gadget injection start at %lld ms, app_data_dir: %s, gadget name: %s, usleep: %u",
+         monotonic_ms(), app_data_dir, frida_gadget_name, time_to_sleep);
+    if (time_to_sleep > 0) {
+        usleep(time_to_sleep);
+        LOGD("Gadget injection delay finished at %lld ms", monotonic_ms());
+    }
 
     std::string app_dir = normalize_dir(app_data_dir ? std::string(app_data_dir) : std::string());
     if (app_dir.empty()) {
@@ -115,7 +125,7 @@ void injection_thread(const char* app_data_dir, const char* frida_gadget_name, u
 
     std::ifstream file(gadget_path);
     if (file) {
-        LOGD("Gadget is ready to load from %s", gadget_path.c_str());
+        LOGD("Gadget is ready to load from %s at %lld ms", gadget_path.c_str(), monotonic_ms());
     } else {
         LOGD("Cannot find gadget in %s", gadget_path.c_str());
         return;
@@ -124,16 +134,18 @@ void injection_thread(const char* app_data_dir, const char* frida_gadget_name, u
     // Prefer dlopen() here. xDL's xdl_open() can return NULL even if the library is
     // actually loaded (pathname mismatch like /data/user/0 vs /data/data symlink).
     dlerror();  // clear
+    LOGD("Gadget dlopen start at %lld ms: %s", monotonic_ms(), gadget_path.c_str());
     void* handle = dlopen(gadget_path.c_str(), RTLD_NOW);
     if (handle) {
-        LOGD("Frida-gadget loaded (dlopen)");
+        LOGD("Gadget dlopen done at %lld ms", monotonic_ms());
     } else {
         const char* err = dlerror();
         LOGE("dlopen failed: %s", err ? err : "(null)");
         // Fallback: try xDL force load for edge cases.
+        LOGD("Gadget xdl_open fallback start at %lld ms", monotonic_ms());
         void* xh = xdl_open(gadget_path.c_str(), XDL_TRY_FORCE_LOAD);
         if (xh) {
-            LOGD("Frida-gadget loaded (xdl_open)");
+            LOGD("Gadget xdl_open done at %lld ms", monotonic_ms());
             handle = xh;
         } else {
             LOGE("Frida-gadget failed to load (xdl_open returned NULL)");
@@ -168,6 +180,7 @@ public:
         }
 
         auto package_name = _env->GetStringUTFChars(args->nice_name, nullptr);
+        LOGD("preAppSpecialize enter for %s at %lld ms", package_name, monotonic_ms());
 
         std::string module_dir = getPathFromFd(_api->getModuleDir());
         int fd = _api->connectCompanion();
@@ -178,7 +191,7 @@ public:
         std::string target_package_name = readString(fd);
 
         if (strcmp(package_name, target_package_name.c_str()) == 0) {
-            LOGD("Enable gadget injection %s", package_name);
+            LOGD("preAppSpecialize matched target %s at %lld ms", package_name, monotonic_ms());
             _enable_gadget_injection = true;
             write(fd, &_enable_gadget_injection, sizeof(_enable_gadget_injection));
 
@@ -202,6 +215,7 @@ public:
             uint delay;
             read(fd, &delay, sizeof(delay));
             _delay = delay;
+            LOGD("Gadget config for %s: delay=%u", package_name, _delay);
 
             std::string frida_gadget_name = readString(fd);
             if (frida_gadget_name.empty()) {
@@ -215,6 +229,11 @@ public:
 
             close(fd);
         } else {
+            LOGD("preAppSpecialize skip non-target %s, target is %s",
+                 package_name,
+                 target_package_name.c_str());
+            _enable_gadget_injection = false;
+            write(fd, &_enable_gadget_injection, sizeof(_enable_gadget_injection));
             _api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             close(fd);
         }
@@ -223,8 +242,18 @@ public:
 
     void postAppSpecialize(const AppSpecializeArgs *args) override {
         if (_enable_gadget_injection) {
-            std::thread t(injection_thread, _app_data_dir, _frida_gadget_name, _delay);
-            t.detach();
+            LOGD("postAppSpecialize enter for %s at %lld ms, delay=%u",
+                 _target_package_name ? _target_package_name : "(unknown)",
+                 monotonic_ms(),
+                 _delay);
+            if (_delay == 0) {
+                LOGD("Loading Gadget synchronously for zero-delay target");
+                injection_thread(_app_data_dir, _frida_gadget_name, _delay);
+            } else {
+                LOGD("Loading Gadget on detached thread because delay is non-zero");
+                std::thread t(injection_thread, _app_data_dir, _frida_gadget_name, _delay);
+                t.detach();
+            }
         }
     }
 
@@ -310,6 +339,10 @@ static void companion_handler(int i) {
     std::string target_package_name = j["package"]["name"];
     uint delay = j["package"]["delay"];
     bool frida_config_mode = j["package"]["mode"]["config"];
+    LOGD("Companion config loaded: target=%s, delay=%u, config_mode=%s",
+         target_package_name.c_str(),
+         delay,
+         frida_config_mode ? "true" : "false");
 
     writeString(i, target_package_name);
 
@@ -352,15 +385,17 @@ static void companion_handler(int i) {
         std::string frida_config_name = find_matching_file(module_dir, frida_config_pattern);
         if (frida_config_name.empty()) {
             LOGW("Config mode enabled but cannot find frida-gadget.config in %s", module_dir.c_str());
-        }
-        std::string frida_config_path = module_dir + "/" + frida_config_name;
+        } else {
+            std::string frida_config_path = module_dir + "/" + frida_config_name;
 
-        std::string new_frida_config_name = frida_gadget_name.substr(0, frida_gadget_name.find_last_of('.')) + ".config.so";
-        copy_src = frida_config_path;
-        copy_dst = app_data_dir + "/" + new_frida_config_name;
-        LOGD("Copy config: %s -> %s", copy_src.c_str(), copy_dst.c_str());
-        if (copy_file(copy_src.c_str(), copy_dst.c_str())) {
-            chown_like_dir(copy_dst.c_str(), app_data_dir.c_str());
+            std::string new_frida_config_name = frida_gadget_name.substr(0, frida_gadget_name.find_last_of('.')) + ".config.so";
+            copy_src = frida_config_path;
+            copy_dst = app_data_dir + "/" + new_frida_config_name;
+            LOGD("Copy config: %s -> %s", copy_src.c_str(), copy_dst.c_str());
+            if (copy_file(copy_src.c_str(), copy_dst.c_str())) {
+                chown_like_dir(copy_dst.c_str(), app_data_dir.c_str());
+                LOGD("Copy config done at %lld ms", monotonic_ms());
+            }
         }
     }
 
@@ -369,6 +404,7 @@ static void companion_handler(int i) {
     LOGD("Copy gadget: %s -> %s", copy_src.c_str(), copy_dst.c_str());
     if (copy_file(copy_src.c_str(), copy_dst.c_str())) {
         chown_like_dir(copy_dst.c_str(), app_data_dir.c_str());
+        LOGD("Copy gadget done at %lld ms", monotonic_ms());
     }
 
     // IMPORTANT: only send gadget name after copy completes.
