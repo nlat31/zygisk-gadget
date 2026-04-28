@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">FriGadgetUI</string>
+    <string name="app_name">ZyGadget</string>
     <string name="tab_apps">Target App</string>
     <string name="tab_options">Gadget Config</string>
     <string name="apply">Apply</string>

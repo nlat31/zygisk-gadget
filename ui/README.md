@@ -2,7 +2,7 @@
 
 如果需要做复杂配置，建议为模块开发一个独立 Android App（需要 root 写配置文件）。
 
-本目录是 `FriGadgetUI`，用于配置 `zygisk_gadget` 模块。
+本目录是 `ZyGadget`，用于配置 `zygisk_gadget` 模块。
 
 ### 配置文件
 
