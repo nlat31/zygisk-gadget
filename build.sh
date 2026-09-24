@@ -22,6 +22,7 @@ What it does (no Gradle / no Java):
 Requirements:
   - Android NDK (path provided via --ndk, or env ANDROID_NDK_HOME)
   - A CMake executable in PATH (or pass --cmake)
+  - Git, with a clean release commit whose local and public version tags match
   - python3 (for module.prop generation + zipping)
 EOF
 }
@@ -38,6 +39,90 @@ info() {
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 require_dir() { [[ -d "$1" ]] || die "Missing directory: $1"; }
 require_file() { [[ -f "$1" ]] || die "Missing file: $1"; }
+
+release_fail() {
+  die "$*
+Release source validation failed. Clean all non-ignored changes, create tag '$RELEASE_VERSION' at HEAD, and push that tag to https://github.com/nlat31/zygisk-gadget.git before building a release zip."
+}
+
+validate_release_source() {
+  RELEASE_VERSION="$1"
+  local public_repo="https://github.com/nlat31/zygisk-gadget.git"
+  local tag_ref="refs/tags/${RELEASE_VERSION}"
+  local head_commit tag_commit top_status submodule_status submodule_clean_output remote_tags
+  local remote_direct="" remote_peeled="" remote_commit="" oid ref
+
+  command -v git >/dev/null 2>&1 || release_fail "Git is required."
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || release_fail "The source directory is not a Git worktree."
+
+  top_status="$(git status --porcelain=v1 --untracked-files=normal)" \
+    || release_fail "Could not inspect the top-level worktree."
+  while IFS= read -r ref; do
+    [[ "${ref:0:3}" == "?? " ]] || continue
+    release_fail "Non-ignored untracked top-level content is present: ${ref:3}
+Untracked source or package inputs can make the binary differ from the tagged source."
+  done <<<"$top_status"
+
+  git diff --quiet -- \
+    || release_fail "Tracked unstaged changes are present."
+  git diff --cached --quiet -- \
+    || release_fail "Tracked staged changes are present."
+
+  git show-ref --verify --quiet "$tag_ref" \
+    || release_fail "Missing local tag '$RELEASE_VERSION' ($tag_ref)."
+  tag_commit="$(git rev-parse "${tag_ref}^{commit}" 2>/dev/null)" \
+    || release_fail "Local tag '$RELEASE_VERSION' does not resolve to a commit."
+  head_commit="$(git rev-parse HEAD 2>/dev/null)" \
+    || release_fail "HEAD does not resolve to a commit."
+  [[ "$tag_commit" == "$head_commit" ]] \
+    || release_fail "Local tag '$RELEASE_VERSION' resolves to $tag_commit, but HEAD is $head_commit."
+
+  if ! submodule_status="$(git submodule status --recursive 2>&1)"; then
+    release_fail "Could not inspect recursive submodules: $submodule_status"
+  fi
+  while IFS= read -r ref; do
+    [[ -z "$ref" ]] && continue
+    case "${ref:0:1}" in
+      -) release_fail "A recursive submodule is not initialized: $ref" ;;
+      +) release_fail "A recursive submodule is not at its recorded gitlink commit: $ref" ;;
+      U) release_fail "A recursive submodule has unresolved conflicts: $ref" ;;
+    esac
+  done <<<"$submodule_status"
+
+  if ! submodule_clean_output="$(
+    git submodule foreach --quiet --recursive '
+      submodule_state="$(git status --porcelain=v1 --untracked-files=normal)" || exit 1
+      if test -n "$submodule_state"; then
+        printf "Submodule %s has non-ignored changes:\n%s\n" \
+          "$displaypath" "$submodule_state" >&2
+        exit 1
+      fi
+    ' 2>&1
+  )"; then
+    release_fail "Every recursive submodule worktree must be completely clean (no staged, unstaged, or non-ignored untracked files).
+$submodule_clean_output"
+  fi
+
+  if ! remote_tags="$(git ls-remote --tags "$public_repo" \
+      "$tag_ref" "${tag_ref}^{}" 2>&1)"; then
+    release_fail "Could not query public tag '$RELEASE_VERSION' at $public_repo: $remote_tags"
+  fi
+  while IFS=$'\t ' read -r oid ref; do
+    case "$ref" in
+      "$tag_ref") remote_direct="$oid" ;;
+      "${tag_ref}^{}") remote_peeled="$oid" ;;
+    esac
+  done <<<"$remote_tags"
+  remote_commit="${remote_peeled:-$remote_direct}"
+  [[ -n "$remote_commit" ]] \
+    || release_fail "Public tag '$RELEASE_VERSION' was not found at $public_repo."
+  [[ "$remote_commit" == "$head_commit" ]] \
+    || release_fail "Public tag '$RELEASE_VERSION' resolves to $remote_commit, but HEAD is $head_commit."
+
+  RELEASE_SOURCE_COMMIT="$head_commit"
+  info "Release source verified: $RELEASE_VERSION at $RELEASE_SOURCE_COMMIT"
+}
 
 parse_args() {
   NDK_DIR="${ANDROID_NDK_HOME:-}"
@@ -106,6 +191,9 @@ main() {
   require_cmd "$CMAKE_BIN"
 
   require_file "$ROOT_DIR/module.conf"
+  require_file "$ROOT_DIR/LICENSE"
+  require_file "$ROOT_DIR/THIRD_PARTY_LICENSES/AGPL-3.0.txt"
+  require_file "$ROOT_DIR/THIRD_PARTY_LICENSES/CSOLoader-NOTICE.md"
   # Parse module.conf safely (do NOT `source` it, as values may contain spaces).
   local conf_json
   conf_json="$(
@@ -134,6 +222,9 @@ PY
   desc="$(python3 -c 'import json,sys;print(json.load(sys.stdin).get("MODULE_DESCRIPTION",""))' <<<"$conf_json")"
   ver="$(python3 -c 'import json,sys;print(json.load(sys.stdin).get("MODULE_VERSION","v0.0.0"))' <<<"$conf_json")"
   vercode="$(python3 -c 'import json,sys;print(json.load(sys.stdin).get("MODULE_VERSION_CODE","0"))' <<<"$conf_json")"
+
+  validate_release_source "$ver"
+  local source_commit="$RELEASE_SOURCE_COMMIT"
 
   local src_dir="$ROOT_DIR/src"
   require_dir "$src_dir"
@@ -211,6 +302,42 @@ PY
   mkdir -p "$stage"
   info "Staging template -> $stage"
   (cd "$ROOT_DIR/template/magisk_module" && tar cf - .) | (cd "$stage" && tar xf -)
+
+  info "Staging licenses and source offer"
+  install -m 0644 "$ROOT_DIR/LICENSE" "$stage/LICENSE"
+  mkdir -p "$stage/THIRD_PARTY_LICENSES"
+  install -m 0644 \
+    "$ROOT_DIR/THIRD_PARTY_LICENSES/AGPL-3.0.txt" \
+    "$stage/THIRD_PARTY_LICENSES/AGPL-3.0.txt"
+  install -m 0644 \
+    "$ROOT_DIR/THIRD_PARTY_LICENSES/CSOLoader-NOTICE.md" \
+    "$stage/THIRD_PARTY_LICENSES/CSOLoader-NOTICE.md"
+  cat >"$stage/SOURCE_OFFER.txt" <<EOF
+SOURCE OFFER FOR ${ver}
+
+The zygisk-gadget module binary in this archive combines the original
+MIT-licensed zygisk-gadget code with statically linked CSOLoader code and is
+distributed under the GNU Affero General Public License, version 3 (AGPLv3).
+
+The complete Corresponding Source is the immutable zygisk-gadget commit:
+  ${source_commit}
+
+That commit is published under tag ${ver} at:
+https://github.com/nlat31/zygisk-gadget.git
+
+Retrieve it recursively with:
+
+  git clone https://github.com/nlat31/zygisk-gadget.git
+  cd zygisk-gadget
+  git checkout ${source_commit}
+  git submodule update --init --recursive
+
+The pinned CSOLoader commit must be:
+  4cf67b87a8d39e765073a63fea148e6d409e4554
+
+The release build verified that local tag ${ver}, the public tag at the URL
+above, and the source commit all resolve to ${source_commit}.
+EOF
 
   info "Generating module.prop"
   python3 - <<PY

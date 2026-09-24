@@ -45,12 +45,27 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${C_FLAGS} ${CXX_FLAGS}")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/xdl/include)
-aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/xdl xdl-src)
+if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/csoloader/CMakeLists.txt")
+    message(FATAL_ERROR
+            "CSOLoader submodule is missing. Run: git submodule update --init --recursive")
+endif ()
 
-add_library(${MODULE_NAME} SHARED main.cpp ${xdl-src})
+function(add_csoloader_subdirectory)
+    if (NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+        set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    elseif (CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS 3.5)
+        set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    endif ()
+    add_subdirectory(external/csoloader)
+endfunction()
+
+add_csoloader_subdirectory()
+set_target_properties(csoloader PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(${MODULE_NAME} SHARED main.cpp)
+target_include_directories(${MODULE_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(${MODULE_NAME} PRIVATE MODULE_DIR_NAME=${MODULE_DIR})
-target_link_libraries(${MODULE_NAME} log)
+target_link_libraries(${MODULE_NAME} PRIVATE csoloader log)
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_custom_command(TARGET ${MODULE_NAME} POST_BUILD

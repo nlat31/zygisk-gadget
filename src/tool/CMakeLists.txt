@@ -41,6 +41,7 @@ set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 add_executable(${TOOL_NAME} main.cpp logcat.cpp)
 target_include_directories(${TOOL_NAME} BEFORE PRIVATE "${GENERATED_INCLUDE_DIR}")
+target_include_directories(${TOOL_NAME} PRIVATE "${CMAKE_SOURCE_DIR}/src/include")
 target_link_libraries(${TOOL_NAME} log)
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")

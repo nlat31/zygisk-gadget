@@ -5,6 +5,7 @@
 #include <sstream>
 #include <array>
 #include <filesystem>
+#include <mutex>
 #include <regex>
 #include <sys/stat.h>
 #include <cerrno>
@@ -14,7 +15,7 @@
 
 #include "zygisk.hpp"
 #include "log.h"
-#include "xdl.h"
+#include "csoloader.h"
 #include "nlohmann/json.hpp"
 
 #define BUFFER_SIZE (64 * 1024)
@@ -33,6 +34,19 @@ using json = nlohmann::json;
 #define ZG_STRINGIFY(value) ZG_STRINGIFY_IMPL(value)
 static constexpr const char* kModuleDirFallback =
         "/data/adb/modules/" ZG_STRINGIFY(MODULE_DIR_NAME);
+
+namespace {
+enum class GadgetLoadState {
+    NotStarted,
+    Loading,
+    Succeeded,
+    Failed,
+};
+
+std::mutex g_gadget_load_mutex;
+GadgetLoadState g_gadget_load_state = GadgetLoadState::NotStarted;
+struct csoloader g_gadget_loader{};
+} // namespace
 
 static bool write_full(int fd, const void* buf, size_t len) {
     const auto* p = static_cast<const uint8_t*>(buf);
@@ -122,13 +136,22 @@ void injection_thread(const char* app_data_dir,
         usleep(time_to_sleep);
     }
 
+    std::lock_guard<std::mutex> lock(g_gadget_load_mutex);
+    if (g_gadget_load_state != GadgetLoadState::NotStarted) {
+        LOGW("Skipping Frida Gadget load: CSOLoader was already invoked in this process");
+        return;
+    }
+    g_gadget_load_state = GadgetLoadState::Loading;
+
     std::string app_dir = normalize_dir(app_data_dir ? std::string(app_data_dir) : std::string());
     if (app_dir.empty()) {
         LOGE("Cannot load Frida Gadget: empty app data directory");
+        g_gadget_load_state = GadgetLoadState::Failed;
         return;
     }
     if (!frida_gadget_name || frida_gadget_name[0] == '\0') {
         LOGE("Cannot load Frida Gadget: empty library filename");
+        g_gadget_load_state = GadgetLoadState::Failed;
         return;
     }
     std::string library_path = app_dir + "/" + frida_gadget_name;
@@ -136,24 +159,35 @@ void injection_thread(const char* app_data_dir,
     std::ifstream file(library_path);
     if (!file) {
         LOGE("Cannot find Frida Gadget in %s", library_path.c_str());
+        g_gadget_load_state = GadgetLoadState::Failed;
         return;
     }
 
-    LOGD("Loading Frida Gadget from %s", library_path.c_str());
-    void* handle = xdl_open(library_path.c_str(), 1);
-    if (handle) {
-        LOGD("Frida Gadget loaded");
-    } else {
-        LOGE("Frida Gadget failed to load");
+    LOGD("Loading Frida Gadget with CSOLoader from %s", library_path.c_str());
+    if (!csoloader_load(&g_gadget_loader, library_path.c_str())) {
+        g_gadget_load_state = GadgetLoadState::Failed;
+        LOGE("CSOLoader failed to load Frida Gadget from %s; temporary files retained",
+             library_path.c_str());
         return;
     }
+    g_gadget_load_state = GadgetLoadState::Succeeded;
+    LOGD("CSOLoader successfully loaded Frida Gadget from %s", library_path.c_str());
 
-    unlink(library_path.c_str());
-    std::regex pattern(".*-gadget.*\\.config\\.so$");
-    std::string frida_config_name = find_matching_file(app_dir, pattern);
-    if (!frida_config_name.empty()) {
-        std::string frida_config_path = app_dir + "/" + frida_config_name;
-        unlink(frida_config_path.c_str());
+    if (unlink(library_path.c_str()) != 0) {
+        LOGW("Failed to delete loaded Frida Gadget %s: %s",
+             library_path.c_str(), strerror(errno));
+    }
+    std::string frida_config_name = frida_gadget_name;
+    const auto extension_pos = frida_config_name.find_last_of('.');
+    if (extension_pos != std::string::npos) {
+        frida_config_name.resize(extension_pos);
+    }
+    frida_config_name += ".config.so";
+    std::string frida_config_path = app_dir + "/" + frida_config_name;
+    if (unlink(frida_config_path.c_str()) != 0 && errno != ENOENT) {
+        const int unlink_errno = errno;
+        LOGW("Failed to delete Frida Gadget config %s: %s",
+             frida_config_path.c_str(), strerror(unlink_errno));
     }
 }
 
