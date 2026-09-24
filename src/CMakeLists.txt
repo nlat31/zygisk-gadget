@@ -9,6 +9,20 @@ endif ()
 if (NOT DEFINED MODULE_DIR)
     message(FATAL_ERROR "MODULE_DIR is not set")
 endif ()
+if (MODULE_DIR STREQUAL "." OR MODULE_DIR STREQUAL "..")
+    message(FATAL_ERROR "MODULE_DIR must not be '.' or '..': ${MODULE_DIR}")
+endif ()
+string(FIND "${MODULE_DIR}" "/" MODULE_DIR_FORWARD_SLASH)
+string(FIND "${MODULE_DIR}" "\\" MODULE_DIR_BACK_SLASH)
+string(FIND "${MODULE_DIR}" ".." MODULE_DIR_TRAVERSAL)
+if (NOT MODULE_DIR_FORWARD_SLASH EQUAL -1
+    OR NOT MODULE_DIR_BACK_SLASH EQUAL -1
+    OR NOT MODULE_DIR_TRAVERSAL EQUAL -1)
+    message(FATAL_ERROR "MODULE_DIR must not contain path separators or traversal: ${MODULE_DIR}")
+endif ()
+if (NOT MODULE_DIR MATCHES "^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    message(FATAL_ERROR "MODULE_DIR contains unsafe characters: ${MODULE_DIR}")
+endif ()
 
 message("Build type: ${CMAKE_BUILD_TYPE}")
 
@@ -35,6 +49,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_D
 aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR}/xdl xdl-src)
 
 add_library(${MODULE_NAME} SHARED main.cpp ${xdl-src})
+target_compile_definitions(${MODULE_NAME} PRIVATE MODULE_DIR_NAME=${MODULE_DIR})
 target_link_libraries(${MODULE_NAME} log)
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")

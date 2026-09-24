@@ -10,7 +10,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdint>
-#include <ctime>
+#include <vector>
 
 #include "zygisk.hpp"
 #include "log.h"
@@ -18,12 +18,21 @@
 #include "nlohmann/json.hpp"
 
 #define BUFFER_SIZE (64 * 1024)
+static constexpr uint32_t kMaxIpcStringLength = 16 * 1024;
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 using zygisk::ServerSpecializeArgs;
 
 using json = nlohmann::json;
+
+#ifndef MODULE_DIR_NAME
+#define MODULE_DIR_NAME zygisk_gadget
+#endif
+#define ZG_STRINGIFY_IMPL(value) #value
+#define ZG_STRINGIFY(value) ZG_STRINGIFY_IMPL(value)
+static constexpr const char* kModuleDirFallback =
+        "/data/adb/modules/" ZG_STRINGIFY(MODULE_DIR_NAME);
 
 static bool write_full(int fd, const void* buf, size_t len) {
     const auto* p = static_cast<const uint8_t*>(buf);
@@ -47,19 +56,23 @@ static bool read_full(int fd, void* buf, size_t len) {
     return true;
 }
 
-static void writeString(int fd, const std::string& str) {
+static bool writeString(int fd, const std::string& str) {
     // Use fixed-width length for stable IPC, and cap to avoid abuse/corruption.
     // Include the null terminator for legacy behavior.
+    if (str.size() >= kMaxIpcStringLength) {
+        LOGE("writeString: string too long (%zu bytes)", str.size());
+        return false;
+    }
     const uint32_t length = static_cast<uint32_t>(str.size() + 1);
-    (void)write_full(fd, &length, sizeof(length));
-    (void)write_full(fd, str.c_str(), length);
+    return write_full(fd, &length, sizeof(length))
+           && write_full(fd, str.c_str(), length);
 }
 
 static std::string readString(int fd) {
     uint32_t length = 0;
     if (!read_full(fd, &length, sizeof(length))) return "";
     // sanity cap: paths / package names should be small
-    if (length == 0 || length > 16 * 1024) {
+    if (length == 0 || length > kMaxIpcStringLength) {
         LOGE("readString: invalid length=%u", length);
         return "";
     }
@@ -102,67 +115,45 @@ static std::string normalize_dir(std::string p) {
     return p;
 }
 
-static long long monotonic_ms() {
-    struct timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<long long>(ts.tv_sec) * 1000LL + ts.tv_nsec / 1000000LL;
-}
-
-void injection_thread(const char* app_data_dir, const char* frida_gadget_name, uint time_to_sleep) {
-    LOGD("Gadget injection start at %lld ms, app_data_dir: %s, gadget name: %s, usleep: %u",
-         monotonic_ms(), app_data_dir, frida_gadget_name, time_to_sleep);
+void injection_thread(const char* app_data_dir,
+                      const char* frida_gadget_name,
+                      uint time_to_sleep) {
     if (time_to_sleep > 0) {
         usleep(time_to_sleep);
-        LOGD("Gadget injection delay finished at %lld ms", monotonic_ms());
     }
 
     std::string app_dir = normalize_dir(app_data_dir ? std::string(app_data_dir) : std::string());
     if (app_dir.empty()) {
-        LOGE("app_data_dir is empty, skip injection");
+        LOGE("Cannot load Frida Gadget: empty app data directory");
         return;
     }
-    std::string gadget_path = app_dir + "/" + std::string(frida_gadget_name);
+    if (!frida_gadget_name || frida_gadget_name[0] == '\0') {
+        LOGE("Cannot load Frida Gadget: empty library filename");
+        return;
+    }
+    std::string library_path = app_dir + "/" + frida_gadget_name;
 
-    std::ifstream file(gadget_path);
-    if (file) {
-        LOGD("Gadget is ready to load from %s at %lld ms", gadget_path.c_str(), monotonic_ms());
-    } else {
-        LOGD("Cannot find gadget in %s", gadget_path.c_str());
+    std::ifstream file(library_path);
+    if (!file) {
+        LOGE("Cannot find Frida Gadget in %s", library_path.c_str());
         return;
     }
 
-    // Prefer dlopen() here. xDL's xdl_open() can return NULL even if the library is
-    // actually loaded (pathname mismatch like /data/user/0 vs /data/data symlink).
-    dlerror();  // clear
-    LOGD("Gadget dlopen start at %lld ms: %s", monotonic_ms(), gadget_path.c_str());
-    void* handle = dlopen(gadget_path.c_str(), RTLD_NOW);
+    LOGD("Loading Frida Gadget from %s", library_path.c_str());
+    void* handle = xdl_open(library_path.c_str(), 1);
     if (handle) {
-        LOGD("Gadget dlopen done at %lld ms", monotonic_ms());
+        LOGD("Frida Gadget loaded");
     } else {
-        const char* err = dlerror();
-        LOGE("dlopen failed: %s", err ? err : "(null)");
-        // Fallback: try xDL force load for edge cases.
-        LOGD("Gadget xdl_open fallback start at %lld ms", monotonic_ms());
-        void* xh = xdl_open(gadget_path.c_str(), XDL_TRY_FORCE_LOAD);
-        if (xh) {
-            LOGD("Gadget xdl_open done at %lld ms", monotonic_ms());
-            handle = xh;
-        } else {
-            LOGE("Frida-gadget failed to load (xdl_open returned NULL)");
-        }
+        LOGE("Frida Gadget failed to load");
+        return;
     }
 
-    // Only cleanup files when gadget is successfully loaded.
-    // If load fails, keep the file so users can inspect permissions/ownership.
-    if (handle) {
-        unlink(gadget_path.c_str());
-        // If there's a frida-gadget config file, remove it too.
-        std::regex pattern(".*-gadget.*\\.config\\.so$");
-        std::string frida_config_name = find_matching_file(app_dir, pattern);
-        if (!frida_config_name.empty()) {
-            std::string frida_config_path = app_dir + "/" + frida_config_name;
-            unlink(frida_config_path.c_str());
-        }
+    unlink(library_path.c_str());
+    std::regex pattern(".*-gadget.*\\.config\\.so$");
+    std::string frida_config_name = find_matching_file(app_dir, pattern);
+    if (!frida_config_name.empty()) {
+        std::string frida_config_path = app_dir + "/" + frida_config_name;
+        unlink(frida_config_path.c_str());
     }
 }
 
@@ -180,52 +171,78 @@ public:
         }
 
         auto package_name = _env->GetStringUTFChars(args->nice_name, nullptr);
-        LOGD("preAppSpecialize enter for %s at %lld ms", package_name, monotonic_ms());
-
         std::string module_dir = getPathFromFd(_api->getModuleDir());
+        if (module_dir.empty()) {
+            module_dir = kModuleDirFallback;
+            LOGW("getModuleDir path resolution failed; fallback to %s", module_dir.c_str());
+        }
         int fd = _api->connectCompanion();
+        if (fd < 0) {
+            LOGE("Failed to connect to companion");
+            _env->ReleaseStringUTFChars(args->nice_name, package_name);
+            return;
+        }
 
         std::string config_file_path = module_dir + "/config";
-        writeString(fd, config_file_path);
+        if (!writeString(fd, config_file_path)) {
+            LOGE("Failed to send config path to companion");
+            close(fd);
+            _env->ReleaseStringUTFChars(args->nice_name, package_name);
+            return;
+        }
 
         std::string target_package_name = readString(fd);
 
         if (strcmp(package_name, target_package_name.c_str()) == 0) {
-            LOGD("preAppSpecialize matched target %s at %lld ms", package_name, monotonic_ms());
+            LOGD("Enable gadget injection for %s", package_name);
             _enable_gadget_injection = true;
-            write(fd, &_enable_gadget_injection, sizeof(_enable_gadget_injection));
-
-            _target_package_name = strdup(target_package_name.c_str());
-
-            // Use the system provided app_data_dir to support multi-user (/data/user/<id>/...)
-            // and avoid hardcoding /data/data.
-            if (args->app_data_dir) {
-                auto app_dir = _env->GetStringUTFChars(args->app_data_dir, nullptr);
-                if (app_dir) {
-                    writeString(fd, app_dir);
-                    _app_data_dir = strdup(app_dir);
-                    _env->ReleaseStringUTFChars(args->app_data_dir, app_dir);
-                } else {
-                    writeString(fd, "");
-                }
-            } else {
-                writeString(fd, "");
-            }
-
-            uint delay;
-            read(fd, &delay, sizeof(delay));
-            _delay = delay;
-            LOGD("Gadget config for %s: delay=%u", package_name, _delay);
-
-            std::string frida_gadget_name = readString(fd);
-            if (frida_gadget_name.empty()) {
-                LOGE("Companion did not provide gadget name, skip injection");
+            if (!write_full(fd, &_enable_gadget_injection,
+                            sizeof(_enable_gadget_injection))) {
+                LOGE("Failed to enable gadget injection in companion");
                 _enable_gadget_injection = false;
                 close(fd);
                 _env->ReleaseStringUTFChars(args->nice_name, package_name);
                 return;
             }
-            _frida_gadget_name = strdup(frida_gadget_name.c_str());
+
+            // Use the system provided app_data_dir to support multi-user (/data/user/<id>/...)
+            // and avoid hardcoding /data/data.
+            std::string resolved_app_data_dir;
+            if (args->app_data_dir) {
+                auto app_dir = _env->GetStringUTFChars(args->app_data_dir, nullptr);
+                if (app_dir) {
+                    resolved_app_data_dir = app_dir;
+                    _env->ReleaseStringUTFChars(args->app_data_dir, app_dir);
+                }
+            }
+            if (resolved_app_data_dir.empty()) {
+                resolved_app_data_dir = "/data/data/" + target_package_name;
+            }
+            if (!writeString(fd, resolved_app_data_dir)) {
+                LOGE("Failed to send app data directory to companion");
+                _enable_gadget_injection = false;
+                close(fd);
+                _env->ReleaseStringUTFChars(args->nice_name, package_name);
+                return;
+            }
+            _app_data_dir = strdup(resolved_app_data_dir.c_str());
+
+            uint delay;
+            if (!read_full(fd, &delay, sizeof(delay))) {
+                LOGE("Failed to read delay from companion");
+                _enable_gadget_injection = false;
+                close(fd);
+                _env->ReleaseStringUTFChars(args->nice_name, package_name);
+                return;
+            }
+            _delay = delay;
+
+            std::string frida_gadget_name = readString(fd);
+            _frida_gadget_name =
+                    frida_gadget_name.empty() ? nullptr : strdup(frida_gadget_name.c_str());
+            LOGD("Target config for %s: delay=%u gadget=%s",
+                 package_name, _delay,
+                 _frida_gadget_name ? _frida_gadget_name : "(none)");
 
             close(fd);
         } else {
@@ -233,7 +250,10 @@ public:
                  package_name,
                  target_package_name.c_str());
             _enable_gadget_injection = false;
-            write(fd, &_enable_gadget_injection, sizeof(_enable_gadget_injection));
+            if (!write_full(fd, &_enable_gadget_injection,
+                            sizeof(_enable_gadget_injection))) {
+                LOGW("Failed to send disabled injection flag to companion");
+            }
             _api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             close(fd);
         }
@@ -242,15 +262,9 @@ public:
 
     void postAppSpecialize(const AppSpecializeArgs *args) override {
         if (_enable_gadget_injection) {
-            LOGD("postAppSpecialize enter for %s at %lld ms, delay=%u",
-                 _target_package_name ? _target_package_name : "(unknown)",
-                 monotonic_ms(),
-                 _delay);
             if (_delay == 0) {
-                LOGD("Loading Gadget synchronously for zero-delay target");
                 injection_thread(_app_data_dir, _frida_gadget_name, _delay);
             } else {
-                LOGD("Loading Gadget on detached thread because delay is non-zero");
                 std::thread t(injection_thread, _app_data_dir, _frida_gadget_name, _delay);
                 t.detach();
             }
@@ -261,7 +275,6 @@ private:
     Api* _api{};
     JNIEnv* _env{};
     bool _enable_gadget_injection = false;
-    char* _target_package_name{};
     char* _app_data_dir{};
     uint _delay{};
     char* _frida_gadget_name{};
@@ -271,9 +284,12 @@ private:
 json get_json(const std::string& path) {
     std::ifstream file(path);
     if (file.is_open()) {
-        json j;
-        file >> j;
+        json j = json::parse(file, nullptr, false);
         file.close();
+        if (j.is_discarded()) {
+            LOGE("Failed to parse JSON config: %s", path.c_str());
+            return nullptr;
+        }
         return j;
     } else {
         LOGD("Failed to open %s", path.c_str());
@@ -310,10 +326,16 @@ static bool copy_file(const char *source_path, const char *dest_path) {
 
     if (ferror(source_file)) {
         LOGE("Error reading from source file %s: %s", source_path, strerror(errno));
+        fclose(source_file);
+        fclose(dest_file);
+        return false;
     }
 
     fclose(source_file);
-    fclose(dest_file);
+    if (fclose(dest_file) != 0) {
+        LOGE("Error flushing destination file %s: %s", dest_path, strerror(errno));
+        return false;
+    }
     return true;
 }
 
@@ -329,87 +351,110 @@ static void chown_like_dir(const char* file_path, const char* dir_path) {
     }
 }
 
+static void companion_reply(int fd, uint delay, const std::string& frida_gadget_name) {
+    if (!write_full(fd, &delay, sizeof(delay))
+        || !writeString(fd, frida_gadget_name)) {
+        LOGE("Failed to send gadget configuration to app process");
+    }
+}
+
+#ifdef __arm__
+static const char* kFridaGadgetPattern = ".*-gadget.*arm\\.so$";
+#elif defined(__aarch64__)
+static const char* kFridaGadgetPattern = ".*-gadget.*arm64\\.so$";
+#elif defined(__i386__)
+static const char* kFridaGadgetPattern = ".*-gadget.*x86\\.so$";
+#elif defined(__x86_64__)
+static const char* kFridaGadgetPattern = ".*-gadget.*x86_64\\.so$";
+#endif
+
 static void companion_handler(int i) {
     std::string config_file_path = readString(i);
 
     json j = get_json(config_file_path);
-    if (j == nullptr) {
-        return;
+    std::string target_package_name;
+    uint delay = 0;
+    bool frida_config_mode = false;
+
+    if (j != nullptr && j.contains("package")) {
+        const auto& pkg = j["package"];
+        if (pkg.contains("name") && pkg["name"].is_string()) {
+            target_package_name = pkg["name"].get<std::string>();
+        }
+        if (pkg.contains("delay") && pkg["delay"].is_number_unsigned()) {
+            delay = pkg["delay"].get<uint>();
+        }
+        if (pkg.contains("mode") && pkg["mode"].is_object() && pkg["mode"].contains("config")
+            && pkg["mode"]["config"].is_boolean()) {
+            frida_config_mode = pkg["mode"]["config"].get<bool>();
+        }
+    } else if (j == nullptr) {
+        LOGE("Companion failed to load config: %s", config_file_path.c_str());
     }
-    std::string target_package_name = j["package"]["name"];
-    uint delay = j["package"]["delay"];
-    bool frida_config_mode = j["package"]["mode"]["config"];
+
     LOGD("Companion config loaded: target=%s, delay=%u, config_mode=%s",
          target_package_name.c_str(),
          delay,
          frida_config_mode ? "true" : "false");
 
-    writeString(i, target_package_name);
+    if (!writeString(i, target_package_name)) {
+        LOGE("Companion failed to send target package name");
+        return;
+    }
 
-    bool enable_gadget_injection;
-    read(i, &enable_gadget_injection, sizeof(enable_gadget_injection));
+    bool enable_gadget_injection = false;
+    if (!read_full(i, &enable_gadget_injection, sizeof(enable_gadget_injection))) {
+        LOGE("Companion failed to read enable_gadget_injection flag");
+        return;
+    }
     if (!enable_gadget_injection) {
         return;
     }
 
-    // Read the actual app data dir from the app process (e.g. /data/user/0/<pkg>).
     std::string app_data_dir = normalize_dir(readString(i));
     if (app_data_dir.empty()) {
         app_data_dir = "/data/data/" + target_package_name;
         LOGW("app_data_dir not provided, fallback to %s", app_data_dir.c_str());
     }
 
-    write(i, &delay, sizeof(delay));
-
-#ifdef __arm__
-    std::regex frida_gadget_pattern(".*-gadget.*arm\\.so$");
-#elifdef __aarch64__
-    std::regex frida_gadget_pattern(".*-gadget.*arm64\\.so$");
-#elifdef __i386__
-    std::regex frida_gadget_pattern(".*-gadget.*x86\\.so$");
-#elifdef __x86_64__
-    std::regex frida_gadget_pattern(".*-gadget.*x86_64\\.so$");
-#endif
-    std::string module_dir = config_file_path.substr(0, config_file_path.rfind('/'));;
-    std::string frida_gadget_name = find_matching_file(module_dir, frida_gadget_pattern);
+    std::string module_dir = config_file_path.substr(0, config_file_path.rfind('/'));
+    std::string frida_gadget_name =
+            find_matching_file(module_dir, std::regex(kFridaGadgetPattern));
     if (frida_gadget_name.empty()) {
-        LOGE("Cannot find gadget in module dir: %s", module_dir.c_str());
+        LOGE("Cannot find Frida Gadget in module directory: %s", module_dir.c_str());
+        companion_reply(i, delay, "");
         return;
     }
     std::string frida_gadget_path = module_dir + "/" + frida_gadget_name;
 
-    std::string copy_src;
-    std::string copy_dst;
     if (frida_config_mode) {
         std::regex frida_config_pattern(".*-gadget\\.config$");
         std::string frida_config_name = find_matching_file(module_dir, frida_config_pattern);
         if (frida_config_name.empty()) {
-            LOGW("Config mode enabled but cannot find frida-gadget.config in %s", module_dir.c_str());
+            LOGW("Config mode enabled but cannot find frida-gadget.config in %s",
+                 module_dir.c_str());
         } else {
             std::string frida_config_path = module_dir + "/" + frida_config_name;
-
-            std::string new_frida_config_name = frida_gadget_name.substr(0, frida_gadget_name.find_last_of('.')) + ".config.so";
-            copy_src = frida_config_path;
-            copy_dst = app_data_dir + "/" + new_frida_config_name;
-            LOGD("Copy config: %s -> %s", copy_src.c_str(), copy_dst.c_str());
-            if (copy_file(copy_src.c_str(), copy_dst.c_str())) {
+            std::string new_frida_config_name =
+                    frida_gadget_name.substr(0, frida_gadget_name.find_last_of('.'))
+                    + ".config.so";
+            std::string copy_dst = app_data_dir + "/" + new_frida_config_name;
+            LOGD("Copy config: %s -> %s", frida_config_path.c_str(), copy_dst.c_str());
+            if (copy_file(frida_config_path.c_str(), copy_dst.c_str())) {
                 chown_like_dir(copy_dst.c_str(), app_data_dir.c_str());
-                LOGD("Copy config done at %lld ms", monotonic_ms());
             }
         }
     }
 
-    copy_src = frida_gadget_path;
-    copy_dst = app_data_dir + "/" + frida_gadget_name;
-    LOGD("Copy gadget: %s -> %s", copy_src.c_str(), copy_dst.c_str());
-    if (copy_file(copy_src.c_str(), copy_dst.c_str())) {
-        chown_like_dir(copy_dst.c_str(), app_data_dir.c_str());
-        LOGD("Copy gadget done at %lld ms", monotonic_ms());
+    std::string copy_dst = app_data_dir + "/" + frida_gadget_name;
+    LOGD("Copy gadget: %s -> %s", frida_gadget_path.c_str(), copy_dst.c_str());
+    if (!copy_file(frida_gadget_path.c_str(), copy_dst.c_str())) {
+        LOGE("Frida Gadget copy failed");
+        companion_reply(i, delay, "");
+        return;
     }
-
-    // IMPORTANT: only send gadget name after copy completes.
-    // Otherwise the app process may attempt to dlopen a partially copied ELF and crash.
-    writeString(i, frida_gadget_name);
+    chown_like_dir(copy_dst.c_str(), app_data_dir.c_str());
+    companion_reply(i, delay, frida_gadget_name);
 }
 
 REGISTER_ZYGISK_MODULE(MyModule)

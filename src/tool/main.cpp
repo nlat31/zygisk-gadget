@@ -2,9 +2,11 @@
 #include <getopt.h>
 #include <iostream>
 #include <fstream>
-#include <thread>
 #include <regex>
+#include <climits>
+#include <cerrno>
 #include <csignal>
+#include <iomanip>
 
 #include "logcat.h"
 #include "nlohmann/json.hpp"
@@ -32,9 +34,12 @@ void show_usage() {
 json get_json(const std::string& path) {
     std::ifstream file(path);
     if (file.is_open()) {
-        json j;
-        file >> j;
+        json j = json::parse(file, nullptr, false);
         file.close();
+        if (j.is_discarded()) {
+            std::cerr << "Failed to parse JSON file: " << path << std::endl;
+            return nullptr;
+        }
         return j;
     } else {
         return nullptr;
@@ -72,22 +77,26 @@ void write_json(const json& j, const string& file_path) {
 }
 
 uint check_delay_optarg(char* option) {
-    // Check if the input starts with a minus sign
+    if (option == nullptr || option[0] == '\0') {
+        std::cerr << "Empty delay value" << std::endl;
+        return static_cast<uint>(-1);
+    }
     if (option[0] == '-') {
         std::cerr << "Negative value is not allowed: " << option << std::endl;
-        return -1;
+        return static_cast<uint>(-1);
     }
-    char *endptr;
-    uint temp_value = strtoul(option, &endptr, 10);
-    if (*endptr != '\0') {
+    char* endptr = nullptr;
+    errno = 0;
+    unsigned long long temp_value = strtoull(option, &endptr, 10);
+    if (endptr == option || *endptr != '\0') {
         std::cerr << "Invalid characters found in the input: " << option << std::endl;
-        return -1;
+        return static_cast<uint>(-1);
     }
-    if (temp_value > UINT_MAX) {
+    if (errno == ERANGE || temp_value > static_cast<unsigned long long>(UINT_MAX)) {
         std::cerr << "Value out of range for unsigned int: " << option << std::endl;
-        return -1;
+        return static_cast<uint>(-1);
     }
-    return temp_value;
+    return static_cast<uint>(temp_value);
 }
 
 namespace fs = std::filesystem;
@@ -178,8 +187,7 @@ int main(int argc, char* argv[]) {
     key_path = {"package", "mode", "config"};
     update_json(j, key_path, config_mode);
 
-    std::thread t(write_json, j, config_file_path);
-    t.detach();
+    write_json(j, config_file_path);
 
     // Register signal handler for SIGINT (Ctrl + C)
     std::signal(SIGINT, signalHandler);
