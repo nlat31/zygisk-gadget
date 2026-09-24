@@ -936,20 +936,29 @@ bool unregister_custom_library_for_backtrace(struct csoloader_elf *img) {
   return false;
 }
 
-bool custom_library_can_unload(struct csoloader_elf *img) {
+bool custom_libraries_prepare_unload(const void *owner) {
   pthread_mutex_lock(&g_custom_libs_mutex);
 
   for (int i = 0; i < MAX_CUSTOM_LIBS; i++) {
     struct custom_lib_info *lib = &g_custom_libs[i];
-    if (!lib->in_use || lib->img != img) continue;
+    if (!lib->in_use || lib->owner != owner) continue;
 
-    bool can_unload =
-      !lib->unregistering
-      && lib->active_refs == 0
-      && (!lib->handle || lib->handle->refs == 0);
-    pthread_mutex_unlock(&g_custom_libs_mutex);
+    if (lib->unregistering
+        || lib->active_refs != 0
+        || (lib->handle && lib->handle->refs != 0)) {
+      pthread_mutex_unlock(&g_custom_libs_mutex);
 
-    return can_unload;
+      return false;
+    }
+  }
+
+  /* INFO: Mark the complete custom-linker scope while still holding the
+           registry lock. New local dlopen/dlsym calls can no longer acquire
+           references between the eligibility check and unmapping. */
+  for (int i = 0; i < MAX_CUSTOM_LIBS; i++) {
+    struct custom_lib_info *lib = &g_custom_libs[i];
+    if (lib->in_use && lib->owner == owner)
+      lib->unregistering = true;
   }
 
   pthread_mutex_unlock(&g_custom_libs_mutex);

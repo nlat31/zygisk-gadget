@@ -12,6 +12,7 @@ BACKTRACE_SUPPORT = (
     ROOT / "src/external/csoloader/src/backtrace-support.c"
 )
 CMAKE = ROOT / "src/CMakeLists.txt"
+BUILD_SCRIPT = ROOT / "build.sh"
 
 
 class TestAnonymousCSOLoader(unittest.TestCase):
@@ -87,6 +88,39 @@ class TestAnonymousCSOLoader(unittest.TestCase):
         self.assertIn("static __thread bool g_custom_dlerror_pending", source)
         self.assertIn("custom_image_soname", source)
         self.assertIn("g_original_libdl_once", source)
+
+    def test_unload_reserves_the_complete_owner_scope_atomically(self) -> None:
+        registry = BACKTRACE_SUPPORT.read_text(encoding="utf-8")
+        linker = LINKER.read_text(encoding="utf-8")
+
+        self.assertIn("custom_libraries_prepare_unload", registry)
+        self.assertIn("lib->owner == owner", registry)
+        self.assertIn("lib->unregistering = true", registry)
+        self.assertIn("custom_libraries_prepare_unload(linker)", linker)
+        self.assertNotIn("custom_library_can_unload", linker)
+
+    def test_x86_64_weak_32_bit_relocations_write_four_bytes(self) -> None:
+        source = LINKER.read_text(encoding="utf-8")
+        weak_branch = source[
+            source.index("if (sym_bind == STB_WEAK)")
+            : source.index("LOGE(\"Symbol '%s' not found", source.index(
+                "if (sym_bind == STB_WEAK)"
+            ))
+        ]
+
+        self.assertIn("*(uint32_t *)target_addr", weak_branch)
+        self.assertIn("*(int32_t *)target_addr", weak_branch)
+        self.assertIn("UINT32_MAX", weak_branch)
+        self.assertIn("INT32_MIN", weak_branch)
+
+    def test_release_assets_and_zip_timestamp_are_pinned(self) -> None:
+        source = BUILD_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('GADGET_REPO" == "hackcatml/ajeossida"', source)
+        self.assertEqual(source.count('"arm64": "2fcf74d2'), 2)
+        self.assertIn("hashlib.sha256", source)
+        self.assertIn("source_date_epoch", source)
+        self.assertIn("ZipInfo(arc, timestamp)", source)
 
 
 if __name__ == "__main__":

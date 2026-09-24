@@ -28,7 +28,7 @@ bool register_custom_library_for_backtrace(struct csoloader_elf *img,
 
 bool unregister_custom_library_for_backtrace(struct csoloader_elf *img);
 
-bool custom_library_can_unload(struct csoloader_elf *img);
+bool custom_libraries_prepare_unload(const void *owner);
 
 void register_eh_frame_for_library(struct csoloader_elf *img);
 

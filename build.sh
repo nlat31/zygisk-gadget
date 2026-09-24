@@ -154,6 +154,13 @@ parse_args() {
         ;;
     esac
   done
+
+  [[ "$GADGET_REPO" == "hackcatml/ajeossida" ]] \
+    || die "Release Gadget repository is pinned to hackcatml/ajeossida"
+  [[ "$GADGET_VERSION" == "16.5.2" ]] \
+    || die "Release Gadget version is pinned to 16.5.2"
+  [[ "$GADGET_PREFIX" == "ajeossida-gadget" ]] \
+    || die "Release Gadget prefix is pinned to ajeossida-gadget"
 }
 
 main() {
@@ -199,6 +206,8 @@ PY
 
   validate_release_source "$ver"
   local source_commit="$RELEASE_SOURCE_COMMIT"
+  local source_date_epoch
+  source_date_epoch="$(git show -s --format=%ct "$source_commit")"
 
   local src_dir="$ROOT_DIR/src"
   require_dir "$src_dir"
@@ -233,6 +242,7 @@ PY
   if [[ "$GADGET_FETCH" == "true" ]]; then
     info "Fetching gadget libraries into build/gadgets (repo=$GADGET_REPO version=$GADGET_VERSION)..."
     python3 - <<PY
+import hashlib
 import urllib.request
 from pathlib import Path
 
@@ -245,22 +255,36 @@ ver = ${GADGET_VERSION@Q}
 prefix = ${GADGET_PREFIX@Q}
 abis = ["arm","arm64","x86","x86_64"]
 tags = [ver, "v"+ver]
+expected = {
+    "arm": "d439c3086861a9bc05c7da4682526a2d5ba035354a4d932a7434b0459e5b4f53",
+    "arm64": "2fcf74d2f7f40864dc7f2a4ec340f850317584f0df3051da3b96889ff82ddeb3",
+    "x86": "b83b23c17d9a5bda614ca09157fd9d30daeb53793a7f9cbc00d8fa9ac30f5c4f",
+    "x86_64": "6bac6c04884d5702e60025dede8b539ad73205e35b1ba8ad195b356ffb6620bc",
+}
 
-def download(url, dest: Path):
+def valid(path: Path, digest: str) -> bool:
+    return (path.exists()
+            and hashlib.sha256(path.read_bytes()).hexdigest() == digest)
+
+def download(url, dest: Path, digest: str):
     with urllib.request.urlopen(url, timeout=30) as r:
-        dest.write_bytes(r.read())
-    return dest.exists() and dest.stat().st_size > 0
+        data = r.read()
+    if hashlib.sha256(data).hexdigest() != digest:
+        return False
+    dest.write_bytes(data)
+    return True
 
 for abi in abis:
     name = f"{prefix}-{ver}-android-{abi}.so"
     dest = out / name
-    if dest.exists() and dest.stat().st_size > 0:
+    digest = expected[abi]
+    if valid(dest, digest):
         continue
     ok = False
     for tag in tags:
         url = f"https://github.com/{repo}/releases/download/{tag}/{name}"
         try:
-            if download(url, dest):
+            if download(url, dest, digest):
                 ok = True
                 break
         except Exception:
@@ -305,10 +329,10 @@ Retrieve it with:
   cd zygisk-gadget
   git checkout ${source_commit}
 
-The vendored CSOLoader baseline is upstream commit
+The vendored CSOLoader source is based on upstream commit
 4cf67b87a8d39e765073a63fea148e6d409e4554, with this project's anonymous
-PT_LOAD mapping and selective dladdr integration changes included in the
-commit above.
+PT_LOAD mapping, Gadget mapped-range entry, and local six-function libdl
+compatibility changes included in the commit above.
 
 The release build verified that local tag ${ver}, the public tag at the URL
 above, and the source commit all resolve to ${source_commit}.
@@ -342,6 +366,7 @@ PY
 
   # Validate gadget libraries are present in module root (provided by template, or fetched if enabled).
   python3 - <<PY
+import hashlib
 from pathlib import Path
 import urllib.request
 
@@ -352,33 +377,45 @@ ver = ${GADGET_VERSION@Q}
 prefix = ${GADGET_PREFIX@Q}
 abis = ["arm","arm64","x86","x86_64"]
 tags = [ver, "v"+ver]
+expected = {
+    "arm": "d439c3086861a9bc05c7da4682526a2d5ba035354a4d932a7434b0459e5b4f53",
+    "arm64": "2fcf74d2f7f40864dc7f2a4ec340f850317584f0df3051da3b96889ff82ddeb3",
+    "x86": "b83b23c17d9a5bda614ca09157fd9d30daeb53793a7f9cbc00d8fa9ac30f5c4f",
+    "x86_64": "6bac6c04884d5702e60025dede8b539ad73205e35b1ba8ad195b356ffb6620bc",
+}
 
-def has(path: Path) -> bool:
-    return path.exists() and path.stat().st_size > 0
+def valid(path: Path, digest: str) -> bool:
+    return (path.exists()
+            and hashlib.sha256(path.read_bytes()).hexdigest() == digest)
 
 missing = []
 for abi in abis:
     name = f"{prefix}-{ver}-android-{abi}.so"
-    if not has(stage / name):
+    if not valid(stage / name, expected[abi]):
         missing.append(name)
 
 if missing and fetch:
     cache = Path(${ROOT_DIR@Q}) / "build" / "gadgets"
     cache.mkdir(parents=True, exist_ok=True)
 
-    def download(url, dest: Path):
+    def download(url, dest: Path, digest: str):
         with urllib.request.urlopen(url, timeout=30) as r:
-            dest.write_bytes(r.read())
-        return has(dest)
+            data = r.read()
+        if hashlib.sha256(data).hexdigest() != digest:
+            return False
+        dest.write_bytes(data)
+        return True
 
     for name in missing:
+        abi = name.removeprefix(f"{prefix}-{ver}-android-").removesuffix(".so")
+        digest = expected[abi]
         dest_cache = cache / name
-        if not has(dest_cache):
+        if not valid(dest_cache, digest):
             ok = False
             for tag in tags:
                 url = f"https://github.com/{repo}/releases/download/{tag}/{name}"
                 try:
-                    if download(url, dest_cache):
+                    if download(url, dest_cache, digest):
                         ok = True
                         break
                 except Exception:
@@ -387,14 +424,13 @@ if missing and fetch:
                 raise SystemExit(f"[!] Failed to fetch {name} from {repo} tags {tags}.")
 
         dest_stage = stage / name
-        if not has(dest_stage):
-            dest_stage.write_bytes(dest_cache.read_bytes())
+        dest_stage.write_bytes(dest_cache.read_bytes())
 
     # re-check
     missing = []
     for abi in abis:
         name = f"{prefix}-{ver}-android-{abi}.so"
-        if not has(stage / name):
+        if not valid(stage / name, expected[abi]):
             missing.append(name)
 
 if missing:
@@ -417,10 +453,11 @@ from pathlib import Path
 
 stage = Path(${stage@Q})
 zip_path = Path(${zip@Q})
+timestamp = time.gmtime(max(int(${source_date_epoch@Q}), 315532800))[:6]
 
 def add_file(zf: zipfile.ZipFile, path: Path, arc: str):
     st = path.stat()
-    zi = zipfile.ZipInfo(arc, time.localtime(st.st_mtime)[:6])
+    zi = zipfile.ZipInfo(arc, timestamp)
     perms = stat.S_IMODE(st.st_mode)
     zi.external_attr = (perms & 0xFFFF) << 16
     with path.open("rb") as f:
@@ -432,7 +469,9 @@ with zipfile.ZipFile(zip_path, "w") as zf:
         if p.is_dir():
             if not arc.endswith("/"):
                 arc += "/"
-            zf.writestr(arc, b"")
+            zi = zipfile.ZipInfo(arc, timestamp)
+            zi.external_attr = (0o755 & 0xFFFF) << 16
+            zf.writestr(zi, b"")
         else:
             add_file(zf, p, arc)
 print(zip_path)

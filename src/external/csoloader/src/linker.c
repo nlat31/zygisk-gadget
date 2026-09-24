@@ -551,25 +551,11 @@ static void _linker_release_dependencies(struct linker *linker, bool unload, boo
 }
 
 bool linker_destroy(struct linker *linker) {
-  if (linker->is_linked) {
-    if (!custom_library_can_unload(linker->img)) {
-      LOGE("Cannot unload %s while libdl compatibility calls or handles are active",
-           linker->img->elf);
+  if (linker->is_linked && !custom_libraries_prepare_unload(linker)) {
+    LOGE("Cannot unload %s while libdl compatibility calls or handles are active",
+         linker->img->elf);
 
-      return false;
-    }
-
-    for (int i = 0; i < linker->dep_count; i++) {
-      struct loaded_dep *dep = &linker->dependencies[i];
-      if (!dep->img || !dep->is_manual_load
-          || custom_library_can_unload(dep->img))
-        continue;
-
-      LOGE("Cannot unload %s while libdl compatibility calls or handles are active",
-           dep->img->elf);
-
-      return false;
-    }
+    return false;
   }
 
   void *main_base = linker->img->base;
@@ -1444,6 +1430,44 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
       struct linker_symbol_info sym = _linker_find_symbol_in_linker_scope(linker, dep->img, sym_name);
       if (!sym.addr) {
         if (sym_bind == STB_WEAK) {
+          #ifdef __x86_64__
+          if (r->type == R_X86_64_32) {
+            uint64_t value = (uint64_t)r->r_addend;
+            if (value > UINT32_MAX) {
+              LOGE("Unresolved weak R_X86_64_32 relocation overflow for '%s' in %s",
+                   sym_name, dep->img->elf);
+
+              return false;
+            }
+
+            *(uint32_t *)target_addr = (uint32_t)value;
+
+            return true;
+          }
+          if (r->type == R_X86_64_PC32) {
+            int64_t value =
+              r->r_addend - (int64_t)(ElfW(Addr))target_addr;
+            if (value < INT32_MIN || value > INT32_MAX) {
+              LOGE("Unresolved weak R_X86_64_PC32 relocation overflow for '%s' in %s",
+                   sym_name, dep->img->elf);
+
+              return false;
+            }
+
+            *(int32_t *)target_addr = (int32_t)value;
+
+            return true;
+          }
+          #elif defined(__i386__)
+          if (r->type == R_386_PC32) {
+            ElfW(Addr) addend =
+              is_rela ? r->r_addend : *(ElfW(Addr) *)target_addr;
+            *target_addr = addend - (ElfW(Addr))target_addr;
+
+            return true;
+          }
+          #endif
+
           ElfW(Addr) weak_value = 0;
           if (r->type == R_GENERIC_ABSOLUTE) weak_value = is_rela ? r->r_addend : *(ElfW(Addr) *)target_addr;
           else if (is_rela) weak_value = r->r_addend;
