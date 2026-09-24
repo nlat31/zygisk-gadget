@@ -29,17 +29,22 @@ process, asks its companion to copy the ABI-matched Gadget and optional config
 into the app data directory, and starts loading from `postAppSpecialize` (either
 immediately or after the configured delay).
 
-Inside the target process, the pinned
-[CSOLoader](https://github.com/ThePedroo/CSOLoader) revision custom-links Frida
+Inside the target process, the vendored
+[CSOLoader](https://github.com/ThePedroo/CSOLoader) baseline custom-links Frida
 Gadget directly. Gadget is not loaded through xDL or the Android system
-`dlopen`. This integration is not ReZygisk's `ptrace`/monitor/
-`remote_csoloader` architecture; ReZygisk is used only as a reference source.
-CSOLoader's optional libdl/PHDR hooks are disabled, matching ReZygisk's default
-mode. Gadget's ordinary `dl_iterate_phdr`, `dladdr`, `dlopen`, `dlsym`, and
-`dlclose` calls therefore go to the Android system linker. CSOLoader's required
-`__tls_get_addr` hook and its constructor/relocation handling remain active.
-The loader remains resident for the life of the process so its TLS and mapping
-state stays valid.
+`dlopen`. Each Gadget `PT_LOAD` segment stays in anonymous memory: CSOLoader
+copies file bytes with `pread` instead of creating file-backed mappings, so the
+Gadget filename does not appear on those lines in `/proc/<pid>/maps`. This
+integration is not ReZygisk's `ptrace`/monitor/`remote_csoloader` architecture;
+ReZygisk is used only as a reference source.
+
+The unsafe optional libdl/PHDR hook group remains disabled. Only `dladdr` calls
+originating in the custom-linked image are redirected so Gadget can resolve its
+logical library path for adjacent configuration discovery. `dl_iterate_phdr`,
+`dlopen`, `dlsym`, and `dlclose` continue to use the Android system linker.
+CSOLoader's required `__tls_get_addr` hook and its constructor/relocation
+handling remain active. The loader remains resident for the life of the process
+so its TLS and mapping state stays valid.
 
 Loading is strict: if CSOLoader fails, there is no fallback path. The Zygisk
 module and CSOLoader state remain resident in the target process. Failed loads
@@ -48,17 +53,11 @@ module attempts to delete the copied Gadget and config (when present), and logs
 any deletion failure.
 
 # Clone
-Clone the repository recursively so the pinned third-party dependencies are
-available:
+CSOLoader is vendored in the repository, so a normal clone contains all source
+dependencies:
 
 ```bash
-git clone --recursive <repository-url>
-```
-
-If the repository was cloned without `--recursive`, initialize the submodules:
-
-```bash
-git submodule update --init --recursive
+git clone <repository-url>
 ```
 
 # Build and Flash
@@ -73,10 +72,8 @@ This project is a **pure NDK + CMake** build (no Gradle / no Java).
   - `ajeossida-gadget-16.5.2-android-x86_64.so`
 
 `build.sh` only creates release archives. Before compiling any ABI, it requires
-all non-ignored content in the top-level and every recursive submodule worktree
-to be clean (no staged, unstaged, or untracked files), every recursive
-submodule to be initialized at its recorded gitlink commit, and the
-`MODULE_VERSION` tag to exist both locally and at
+all tracked content to be clean, no non-ignored untracked top-level content,
+and the `MODULE_VERSION` tag to exist both locally and at
 <https://github.com/nlat31/zygisk-gadget.git>. The local tag, public tag, and
 clean `HEAD` must all resolve to the same commit.
 
@@ -114,10 +111,10 @@ must not produce a file named as a release zip.
 The original zygisk-gadget source is licensed under the MIT License; see
 [`LICENSE`](LICENSE).
 
-This repository also includes
-[CSOLoader](https://github.com/ThePedroo/CSOLoader) at pinned commit
-`4cf67b87a8d39e765073a63fea148e6d409e4554`. CSOLoader is licensed under
-AGPLv3. See
+This repository vendors
+[CSOLoader](https://github.com/ThePedroo/CSOLoader), based on upstream commit
+`4cf67b87a8d39e765073a63fea148e6d409e4554` with local integration changes.
+CSOLoader is licensed under AGPLv3. See
 [`THIRD_PARTY_LICENSES/CSOLoader-NOTICE.md`](THIRD_PARTY_LICENSES/CSOLoader-NOTICE.md)
 and the accompanying
 [`AGPLv3 text`](THIRD_PARTY_LICENSES/AGPL-3.0.txt).
@@ -127,8 +124,8 @@ a combined work that must be distributed in compliance with AGPLv3, including
 the applicable source-code and licensing requirements. Release archives carry
 the license texts, third-party notice, and an immutable-commit source offer.
 Creating one requires a clean `HEAD` whose matching local and public version
-tags resolve to that same commit, with all non-ignored top-level and recursive
-submodule worktrees clean and every submodule at its recorded commit.
+tags resolve to that same commit and no non-ignored untracked top-level
+content.
 
 # Credits
 [CSOLoader](https://github.com/ThePedroo/CSOLoader)<br>

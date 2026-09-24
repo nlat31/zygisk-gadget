@@ -49,7 +49,7 @@ validate_release_source() {
   RELEASE_VERSION="$1"
   local public_repo="https://github.com/nlat31/zygisk-gadget.git"
   local tag_ref="refs/tags/${RELEASE_VERSION}"
-  local head_commit tag_commit top_status submodule_status submodule_clean_output remote_tags
+  local head_commit tag_commit top_status remote_tags
   local remote_direct="" remote_peeled="" remote_commit="" oid ref
 
   command -v git >/dev/null 2>&1 || release_fail "Git is required."
@@ -77,32 +77,6 @@ Untracked source or package inputs can make the binary differ from the tagged so
     || release_fail "HEAD does not resolve to a commit."
   [[ "$tag_commit" == "$head_commit" ]] \
     || release_fail "Local tag '$RELEASE_VERSION' resolves to $tag_commit, but HEAD is $head_commit."
-
-  if ! submodule_status="$(git submodule status --recursive 2>&1)"; then
-    release_fail "Could not inspect recursive submodules: $submodule_status"
-  fi
-  while IFS= read -r ref; do
-    [[ -z "$ref" ]] && continue
-    case "${ref:0:1}" in
-      -) release_fail "A recursive submodule is not initialized: $ref" ;;
-      +) release_fail "A recursive submodule is not at its recorded gitlink commit: $ref" ;;
-      U) release_fail "A recursive submodule has unresolved conflicts: $ref" ;;
-    esac
-  done <<<"$submodule_status"
-
-  if ! submodule_clean_output="$(
-    git submodule foreach --quiet --recursive '
-      submodule_state="$(git status --porcelain=v1 --untracked-files=normal)" || exit 1
-      if test -n "$submodule_state"; then
-        printf "Submodule %s has non-ignored changes:\n%s\n" \
-          "$displaypath" "$submodule_state" >&2
-        exit 1
-      fi
-    ' 2>&1
-  )"; then
-    release_fail "Every recursive submodule worktree must be completely clean (no staged, unstaged, or non-ignored untracked files).
-$submodule_clean_output"
-  fi
 
   if ! remote_tags="$(git ls-remote --tags "$public_repo" \
       "$tag_ref" "${tag_ref}^{}" 2>&1)"; then
@@ -325,15 +299,16 @@ The complete Corresponding Source is the immutable zygisk-gadget commit:
 That commit is published under tag ${ver} at:
 https://github.com/nlat31/zygisk-gadget.git
 
-Retrieve it recursively with:
+Retrieve it with:
 
   git clone https://github.com/nlat31/zygisk-gadget.git
   cd zygisk-gadget
   git checkout ${source_commit}
-  git submodule update --init --recursive
 
-The pinned CSOLoader commit must be:
-  4cf67b87a8d39e765073a63fea148e6d409e4554
+The vendored CSOLoader baseline is upstream commit
+4cf67b87a8d39e765073a63fea148e6d409e4554, with this project's anonymous
+PT_LOAD mapping and selective dladdr integration changes included in the
+commit above.
 
 The release build verified that local tag ${ver}, the public tag at the URL
 above, and the source commit all resolve to ${source_commit}.

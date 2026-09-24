@@ -47,7 +47,7 @@ set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/csoloader/CMakeLists.txt")
     message(FATAL_ERROR
-            "CSOLoader submodule is missing. Run: git submodule update --init --recursive")
+            "Vendored CSOLoader sources are missing from src/external/csoloader")
 endif ()
 
 function(add_csoloader_subdirectory)
@@ -61,6 +61,7 @@ endfunction()
 
 add_csoloader_subdirectory()
 set_target_properties(csoloader PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(csoloader PRIVATE CSOLOADER_HOOK_DLADDR)
 
 add_library(${MODULE_NAME} SHARED main.cpp)
 target_include_directories(${MODULE_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
