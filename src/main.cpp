@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <fstream>
 #include <sstream>
+#include <iterator>
 #include <array>
 #include <filesystem>
 #include <mutex>
@@ -155,6 +156,13 @@ void injection_thread(const char* app_data_dir,
         return;
     }
     std::string library_path = app_dir + "/" + frida_gadget_name;
+    std::string frida_config_name = frida_gadget_name;
+    const auto extension_pos = frida_config_name.find_last_of('.');
+    if (extension_pos != std::string::npos) {
+        frida_config_name.resize(extension_pos);
+    }
+    frida_config_name += ".config.so";
+    std::string frida_config_path = app_dir + "/" + frida_config_name;
 
     std::ifstream file(library_path);
     if (!file) {
@@ -163,8 +171,38 @@ void injection_thread(const char* app_data_dir,
         return;
     }
 
+    std::string config_data;
+    bool has_config_data = false;
+    struct stat config_stat {};
+    if (stat(frida_config_path.c_str(), &config_stat) == 0) {
+        std::ifstream config_file(frida_config_path, std::ios::binary);
+        if (!config_file) {
+            LOGE("Cannot read Frida Gadget config %s", frida_config_path.c_str());
+            g_gadget_load_state = GadgetLoadState::Failed;
+            return;
+        }
+        config_data.assign(std::istreambuf_iterator<char>(config_file),
+                           std::istreambuf_iterator<char>());
+        if (config_file.bad()) {
+            LOGE("Failed while reading Frida Gadget config %s",
+                 frida_config_path.c_str());
+            g_gadget_load_state = GadgetLoadState::Failed;
+            return;
+        }
+        has_config_data = true;
+    } else if (errno != ENOENT) {
+        const int stat_errno = errno;
+        LOGE("Cannot inspect Frida Gadget config %s: %s",
+             frida_config_path.c_str(), strerror(stat_errno));
+        g_gadget_load_state = GadgetLoadState::Failed;
+        return;
+    }
+
     LOGD("Loading Frida Gadget with CSOLoader from %s", library_path.c_str());
-    if (!csoloader_load(&g_gadget_loader, library_path.c_str())) {
+    if (!csoloader_load_with_mapped_range(
+            &g_gadget_loader,
+            library_path.c_str(),
+            has_config_data ? config_data.c_str() : nullptr)) {
         g_gadget_load_state = GadgetLoadState::Failed;
         LOGE("CSOLoader failed to load Frida Gadget from %s; temporary files retained",
              library_path.c_str());
@@ -177,13 +215,6 @@ void injection_thread(const char* app_data_dir,
         LOGW("Failed to delete loaded Frida Gadget %s: %s",
              library_path.c_str(), strerror(errno));
     }
-    std::string frida_config_name = frida_gadget_name;
-    const auto extension_pos = frida_config_name.find_last_of('.');
-    if (extension_pos != std::string::npos) {
-        frida_config_name.resize(extension_pos);
-    }
-    frida_config_name += ".config.so";
-    std::string frida_config_path = app_dir + "/" + frida_config_name;
     if (unlink(frida_config_path.c_str()) != 0 && errno != ENOENT) {
         const int unlink_errno = errno;
         LOGW("Failed to delete Frida Gadget config %s: %s",

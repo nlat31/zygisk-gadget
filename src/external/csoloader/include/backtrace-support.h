@@ -14,9 +14,21 @@ int custom_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *
 
 int custom_dladdr(const void *addr, Dl_info *info);
 
-bool register_custom_library_for_backtrace(struct csoloader_elf *img);
+void *custom_dlopen(const char *filename, int flags);
+
+void *custom_dlsym(void *handle, const char *symbol);
+
+int custom_dlclose(void *handle);
+
+char *custom_dlerror(void);
+
+bool register_custom_library_for_backtrace(struct csoloader_elf *img,
+                                           const void *owner,
+                                           size_t scope_index);
 
 bool unregister_custom_library_for_backtrace(struct csoloader_elf *img);
+
+bool custom_library_can_unload(struct csoloader_elf *img);
 
 void register_eh_frame_for_library(struct csoloader_elf *img);
 

@@ -29,7 +29,10 @@ extern int g_argc;
 extern char **g_argv;
 extern char **g_envp;
 
-bool csoloader_load(struct csoloader *lib, const char *lib_path) {
+static bool csoloader_load_internal(struct csoloader *lib,
+                                    const char *lib_path,
+                                    bool use_mapped_range_entry,
+                                    const char *config_data) {
   struct loaded_dep dep_info = { 0 };
   void *map_start = linker_load_library_manually(lib_path, &dep_info);
   if (!map_start) {
@@ -59,11 +62,13 @@ bool csoloader_load(struct csoloader *lib, const char *lib_path) {
   }
 
   lib->linker.main_map_size = dep_info.map_size;
+  lib->linker.use_mapped_range_entry = use_mapped_range_entry;
+  lib->linker.mapped_range_config_data = config_data;
 
   if (!linker_link(&lib->linker)) {
     LOGE("Linker failed to link %s", lib_path);
 
-    linker_destroy(&lib->linker);
+    (void)linker_destroy(&lib->linker);
 
     return false;
   }
@@ -73,7 +78,7 @@ bool csoloader_load(struct csoloader *lib, const char *lib_path) {
   if (!lib->lib_path) {
     LOGE("Failed to duplicate library path string");
 
-    linker_destroy(&lib->linker);
+    (void)linker_destroy(&lib->linker);
 
     return false;
   }
@@ -81,8 +86,19 @@ bool csoloader_load(struct csoloader *lib, const char *lib_path) {
   return true;
 }
 
+bool csoloader_load(struct csoloader *lib, const char *lib_path) {
+  return csoloader_load_internal(lib, lib_path, false, NULL);
+}
+
+bool csoloader_load_with_mapped_range(struct csoloader *lib,
+                                      const char *lib_path,
+                                      const char *config_data) {
+  return csoloader_load_internal(lib, lib_path, true, config_data);
+}
+
 bool csoloader_unload(struct csoloader *lib) {
-  linker_destroy(&lib->linker);
+  if (!linker_destroy(&lib->linker))
+    return false;
 
   free(lib->lib_path);
   

@@ -17,6 +17,11 @@ struct csoloader {
 /* INFO: Load a library to memory and link it */
 bool csoloader_load(struct csoloader *lib, const char *lib_path);
 
+/* INFO: Load a library whose final constructor accepts its mapped range */
+bool csoloader_load_with_mapped_range(struct csoloader *lib,
+                                      const char *lib_path,
+                                      const char *config_data);
+
 /* INFO: Unload the library and free all related resources */
 bool csoloader_unload(struct csoloader *lib);
 

@@ -1,12 +1,12 @@
 # CSOLoader third-party notice
 
 This repository includes [CSOLoader](https://github.com/ThePedroo/CSOLoader)
-as a Git submodule at `src/external/csoloader`, pinned to commit
-`4cf67b87a8d39e765073a63fea148e6d409e4554`.
+as vendored source at `src/external/csoloader`, based on upstream commit
+`4cf67b87a8d39e765073a63fea148e6d409e4554` with local integration changes.
 
 CSOLoader is licensed under the GNU Affero General Public License, version 3
 (AGPLv3). A complete copy of that license is provided in
-`THIRD_PARTY_LICENSES/AGPL-3.0.txt` and in the CSOLoader submodule as
+`THIRD_PARTY_LICENSES/AGPL-3.0.txt` and in the vendored CSOLoader source as
 `src/external/csoloader/LICENSE`.
 
 The root `LICENSE` continues to apply to the original zygisk-gadget source

@@ -63,6 +63,7 @@ struct csoloader_elf {
   size_t tls_mod_id;
 
   struct symtabs *symtabs_;
+  pthread_mutex_t symtabs_mutex;
 
   linker_ctor_function_t *preinit_array;
   size_t preinit_array_count;

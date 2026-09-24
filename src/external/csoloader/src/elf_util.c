@@ -166,6 +166,7 @@ void csoloader_elf_destroy(struct csoloader_elf *img) {
     img->header = NULL;
   }
 
+  pthread_mutex_destroy(&img->symtabs_mutex);
   free(img);
 }
 
@@ -177,11 +178,18 @@ struct csoloader_elf *csoloader_elf_create(const char *elf, void *base) {
     return NULL;
   }
 
+  if (pthread_mutex_init(&img->symtabs_mutex, NULL) != 0) {
+    LOGE("Failed to initialize symtabs mutex");
+    free(img);
+
+    return NULL;
+  }
+
   img->elf = strdup(elf);
   if (!img->elf) {
     LOGE("Failed to duplicate elf path string");
 
-    free(img);
+    csoloader_elf_destroy(img);
 
     return NULL;
   }
@@ -637,10 +645,16 @@ struct csoloader_elf *csoloader_elf_create(const char *elf, void *base) {
 }
 
 static bool load_symtabs(struct csoloader_elf *img) {
-  if (img->symtabs_) return true;
+  pthread_mutex_lock(&img->symtabs_mutex);
+  if (img->symtabs_) {
+    pthread_mutex_unlock(&img->symtabs_mutex);
+
+    return true;
+  }
 
   if (!img->symtab_start || img->symstr_offset_for_symtab == 0 || img->symtab_count == 0) {
     // LOGE("Cannot load symtabs: .symtab section or its string table not found/valid.");
+    pthread_mutex_unlock(&img->symtabs_mutex);
 
     return false;
   }
@@ -648,13 +662,16 @@ static bool load_symtabs(struct csoloader_elf *img) {
   size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
   if (valid_symtabs_amount == 0) {
     LOGW("No valid symbols (FUNC/OBJECT with size > 0) found in .symtab for %s", img->elf);
+    pthread_mutex_unlock(&img->symtabs_mutex);
 
     return false;
   }
 
-  img->symtabs_ = (struct symtabs *)calloc(valid_symtabs_amount, sizeof(struct symtabs));
-  if (!img->symtabs_) {
+  struct symtabs *new_symtabs =
+    (struct symtabs *)calloc(valid_symtabs_amount, sizeof(struct symtabs));
+  if (!new_symtabs) {
     LOGE("Failed to allocate memory for symtabs array");
+    pthread_mutex_unlock(&img->symtabs_mutex);
 
     return false;
   }
@@ -678,26 +695,29 @@ static bool load_symtabs(struct csoloader_elf *img) {
         continue;
       }
 
-      img->symtabs_[current_valid_index].name = strdup(st_name);
-      if (!img->symtabs_[current_valid_index].name) {
+      new_symtabs[current_valid_index].name = strdup(st_name);
+      if (!new_symtabs[current_valid_index].name) {
         LOGE("Failed to duplicate symbol name: %s", st_name);
 
         for(size_t k = 0; k < current_valid_index; ++k) {
-          free(img->symtabs_[k].name);
+          free(new_symtabs[k].name);
         }
 
-        free(img->symtabs_);
-        img->symtabs_ = NULL;
+        free(new_symtabs);
+        pthread_mutex_unlock(&img->symtabs_mutex);
 
         return false;
       }
 
-      img->symtabs_[current_valid_index].sym = current_sym;
+      new_symtabs[current_valid_index].sym = current_sym;
 
       current_valid_index++;
       if (current_valid_index == valid_symtabs_amount) break;
     }
   }
+
+  img->symtabs_ = new_symtabs;
+  pthread_mutex_unlock(&img->symtabs_mutex);
 
   return true;
 }

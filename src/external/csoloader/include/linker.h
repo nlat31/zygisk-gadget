@@ -43,17 +43,29 @@ struct linker {
 
   size_t main_map_size;
   bool is_linked;
+  bool use_mapped_range_entry;
+  const char *mapped_range_config_data;
 };
 
 void *linker_load_library_manually(const char *lib_path, struct loaded_dep *dep_info);
 
 bool linker_init(struct linker *linker, struct csoloader_elf *img);
 
-void linker_destroy(struct linker *linker);
+bool linker_destroy(struct linker *linker);
 
 void linker_abandon(struct linker *linker);
 
 bool linker_link(struct linker *linker);
+
+void *linker_dlsym_default(struct linker *linker, const char *symbol);
+
+void *linker_dlsym_handle(struct linker *linker,
+                          struct csoloader_elf *requester,
+                          const char *symbol);
+
+void *linker_dlsym_next(struct linker *linker,
+                        struct csoloader_elf *requester,
+                        const char *symbol);
 
 void linker_deinit(void);
 

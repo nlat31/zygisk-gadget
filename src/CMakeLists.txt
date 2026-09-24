@@ -61,7 +61,7 @@ endfunction()
 
 add_csoloader_subdirectory()
 set_target_properties(csoloader PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_compile_definitions(csoloader PRIVATE CSOLOADER_HOOK_DLADDR)
+target_compile_definitions(csoloader PRIVATE CSOLOADER_HOOK_LIBDL)
 
 add_library(${MODULE_NAME} SHARED main.cpp)
 target_include_directories(${MODULE_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

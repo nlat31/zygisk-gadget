@@ -117,61 +117,6 @@
 
 static size_t system_page_size;
 
-#define MAX_ACTIVE_LINKERS 16
-static struct linker *g_active_linkers[MAX_ACTIVE_LINKERS];
-static int g_active_linker_count = 0;
-
-static void _linker_register(struct linker *linker) {
-  for (int i = 0; i < g_active_linker_count; i++) {
-    if (g_active_linkers[i] == linker) return;
-  }
-
-  if (g_active_linker_count >= MAX_ACTIVE_LINKERS) {
-    LOGF("Maximum active linker count (%d) exceeded", MAX_ACTIVE_LINKERS);
-
-    return;
-  }
-
-  g_active_linkers[g_active_linker_count++] = linker;
-}
-
-static void _linker_unregister(struct linker *linker) {
-  for (int i = 0; i < g_active_linker_count; i++) {
-    if (g_active_linkers[i] != linker) continue;
-
-    g_active_linkers[i] = g_active_linkers[--g_active_linker_count];
-    g_active_linkers[g_active_linker_count] = NULL;
-
-    return;
-  }
-}
-
-#ifdef CSOLOADER_MAKE_LINKER_HOOKS
-  static struct linker *_linker_find_by_caller_address(void *caller_addr) {
-    uintptr_t addr = (uintptr_t)caller_addr;
-
-    for (int i = 0; i < g_active_linker_count; i++) {
-      struct linker *linker = g_active_linkers[i];
-      if (!linker || !linker->img) continue;
-
-      uintptr_t main_base = (uintptr_t)linker->img->base;
-      if (addr >= main_base && addr < main_base + linker->main_map_size)
-        return linker;
-
-      for (int j = 0; j < linker->dep_count; j++) {
-        struct loaded_dep *dep = &linker->dependencies[j];
-        if (!dep->img || !dep->is_manual_load || dep->map_size == 0) continue;
-
-        uintptr_t dep_base = (uintptr_t)dep->img->base;
-        if (addr >= dep_base && addr < dep_base + dep->map_size)
-          return linker;
-      }
-    }
-
-    return NULL;
-  }
-#endif /* CSOLOADER_MAKE_LINKER_HOOKS */
-
 static inline uintptr_t _page_start(uintptr_t addr) {
   return ALIGN_DOWN(addr, system_page_size);
 }
@@ -249,6 +194,134 @@ static void _linker_call_constructors(struct csoloader_elf *img) {
       img->init_array[i](g_argc, g_argv, g_envp);
     }
   }
+}
+
+struct csoloader_memory_range {
+  uintptr_t base_address;
+  size_t size;
+};
+
+typedef void (*csoloader_mapped_range_entry)(
+    const struct csoloader_memory_range *mapped_range,
+    const char *config_data,
+    int *result);
+
+static bool _linker_address_in_main_image(const struct linker *linker,
+                                          uintptr_t address,
+                                          size_t size) {
+  uintptr_t start = (uintptr_t)linker->img->base;
+  uintptr_t end;
+
+  if (__builtin_add_overflow(start, linker->main_map_size, &end) ||
+      address < start || address > end)
+    return false;
+
+  return size <= end - address;
+}
+
+static csoloader_mapped_range_entry _linker_decode_mapped_range_entry(
+    const struct linker *linker,
+    void (*wrapper)(int, char **, char **)) {
+  uintptr_t wrapper_address = (uintptr_t)wrapper;
+  uintptr_t target = 0;
+
+#if defined(__aarch64__)
+  const uint32_t *code = (const uint32_t *)wrapper_address;
+  if (!_linker_address_in_main_image(linker, wrapper_address,
+                                     4 * sizeof(uint32_t)) ||
+      code[0] != UINT32_C(0xaa1f03e0) ||
+      code[1] != UINT32_C(0xaa1f03e1) ||
+      code[2] != UINT32_C(0xaa1f03e2) ||
+      (code[3] & UINT32_C(0xfc000000)) != UINT32_C(0x14000000))
+    return NULL;
+
+  int64_t displacement = (int64_t)(code[3] & UINT32_C(0x03ffffff));
+  if ((displacement & (INT64_C(1) << 25)) != 0)
+    displacement -= INT64_C(1) << 26;
+  target = wrapper_address + 3 * sizeof(uint32_t) +
+           (uintptr_t)(displacement * 4);
+#elif defined(__arm__)
+  wrapper_address &= ~(uintptr_t)1;
+  const uint32_t *code = (const uint32_t *)wrapper_address;
+  if (!_linker_address_in_main_image(linker, wrapper_address,
+                                     4 * sizeof(uint32_t)) ||
+      code[0] != UINT32_C(0xe3a00000) ||
+      code[1] != UINT32_C(0xe3a01000) ||
+      code[2] != UINT32_C(0xe3a02000) ||
+      (code[3] & UINT32_C(0xff000000)) != UINT32_C(0xea000000))
+    return NULL;
+
+  int32_t displacement = (int32_t)(code[3] & UINT32_C(0x00ffffff));
+  if ((displacement & (INT32_C(1) << 23)) != 0)
+    displacement |= (int32_t)UINT32_C(0xff000000);
+  target = wrapper_address + 3 * sizeof(uint32_t) + 8 +
+           (uintptr_t)(displacement * 4);
+#elif defined(__x86_64__)
+  const uint8_t expected[] = {
+      0x31, 0xff, 0x31, 0xf6, 0x31, 0xd2, 0xe9
+  };
+  const uint8_t *code = (const uint8_t *)wrapper_address;
+  if (!_linker_address_in_main_image(linker, wrapper_address,
+                                     sizeof(expected) + sizeof(int32_t)) ||
+      memcmp(code, expected, sizeof(expected)) != 0)
+    return NULL;
+
+  int32_t displacement;
+  memcpy(&displacement, code + sizeof(expected), sizeof(displacement));
+  target = wrapper_address + sizeof(expected) + sizeof(displacement) +
+           (intptr_t)displacement;
+#elif defined(__i386__)
+  const uint8_t *code = (const uint8_t *)wrapper_address;
+  const uint8_t call_sequence[] = {
+      0x6a, 0x00, 0x6a, 0x00, 0x6a, 0x00, 0xe8
+  };
+  const size_t scan_size = 96;
+  if (!_linker_address_in_main_image(linker, wrapper_address, scan_size))
+    return NULL;
+
+  for (size_t i = 0;
+       i + sizeof(call_sequence) + sizeof(int32_t) <= scan_size;
+       ++i) {
+    if (memcmp(code + i, call_sequence, sizeof(call_sequence)) != 0)
+      continue;
+
+    int32_t displacement;
+    memcpy(&displacement, code + i + sizeof(call_sequence),
+           sizeof(displacement));
+    target = wrapper_address + i + sizeof(call_sequence) +
+             sizeof(displacement) + (intptr_t)displacement;
+    break;
+  }
+#else
+  (void)linker;
+  (void)wrapper_address;
+  return NULL;
+#endif
+
+  if (target == 0 || !_linker_address_in_main_image(linker, target, 1))
+    return NULL;
+
+  return (csoloader_mapped_range_entry)target;
+}
+
+static bool _linker_call_mapped_range_constructors(
+    struct linker *linker,
+    csoloader_mapped_range_entry entry) {
+  struct csoloader_elf *img = linker->img;
+  size_t original_count = img->init_array_count;
+
+  img->init_array_count = original_count - 1;
+  _linker_call_constructors(img);
+  img->init_array_count = original_count;
+
+  struct csoloader_memory_range mapped_range = {
+      .base_address = (uintptr_t)img->base,
+      .size = linker->main_map_size,
+  };
+  LOGD("Calling mapped-range entry at %p for %s", entry, img->elf);
+  entry(&mapped_range, linker->mapped_range_config_data, NULL);
+
+  return true;
 }
 
 static void _linker_call_destructors(struct csoloader_elf *img) {
@@ -418,89 +491,6 @@ static bool _linker_find_library_path(const char *lib_name, char *full_path, siz
   return false;
 }
 
-#ifdef CSOLOADER_MAKE_LINKER_HOOKS
-  static struct csoloader_elf *_linker_find_loaded_image(struct linker *linker, const char *name) {
-    const char *base_name = _path_basename(name);
-    if (linker->img && (strcmp(linker->img->elf, name) == 0 || strcmp(_path_basename(linker->img->elf), base_name) == 0))
-      return linker->img;
-
-    for (int i = 0; i < linker->dep_count; i++) {
-      struct loaded_dep *dep = &linker->dependencies[i];
-      if (!dep->img || !dep->is_manual_load) continue;
-
-      if (strcmp(dep->img->elf, name) == 0 || strcmp(_path_basename(dep->img->elf), base_name) == 0)
-        return dep->img;
-    }
-
-    return NULL;
-  }
-
-  static struct csoloader_elf *_linker_image_from_handle(struct linker *linker, void *handle) {
-    if (!linker || !handle || handle == RTLD_DEFAULT || handle == RTLD_NEXT) return NULL;
-    if (handle == linker->img) return linker->img;
-
-    for (int i = 0; i < linker->dep_count; i++) {
-      if (!linker->dependencies[i].is_manual_load || handle != linker->dependencies[i].img) continue;
-
-      return linker->dependencies[i].img;
-    }
-
-    return NULL;
-  }
-
-  static void *_linker_get_original_libdl_symbol(const char *name) {
-    struct csoloader_elf *libdl_elf = csoloader_elf_create("libdl.so", NULL);
-    if (!libdl_elf) return NULL;
-
-    void *sym = (void *)csoloader_elf_symb_address(libdl_elf, name);
-    csoloader_elf_destroy(libdl_elf);
-
-    return sym;
-  }
-
-  static void *custom_dlopen(const char *filename, int flags) {
-    void *(*original_dlopen)(const char *, int) = (void *(*)(const char *, int))_linker_get_original_libdl_symbol("dlopen");
-    if (!filename) return original_dlopen ? original_dlopen(filename, flags) : NULL;
-
-    struct linker *linker = _linker_find_by_caller_address(__builtin_return_address(0));
-    if (linker) {
-      struct csoloader_elf *img = _linker_find_loaded_image(linker, filename);    
-      if (img) return img;
-    }
-
-    return original_dlopen ? original_dlopen(filename, flags) : NULL;
-  }
-
-  /* INFO: If a handle is shared between modules, this will not be able to find it.*/
-  static void *custom_dlsym(void *handle, const char *symbol) {
-    void *(*original_dlsym)(void *, const char *) = (void *(*)(void *, const char *))_linker_get_original_libdl_symbol("dlsym");
-
-    struct linker *linker = _linker_find_by_caller_address(__builtin_return_address(0));
-    struct csoloader_elf *img = _linker_image_from_handle(linker, handle);
-    if (img) {
-      if (!symbol) return NULL;
-
-      void *sym = (void *)csoloader_elf_symb_address_exported(img, symbol);
-      if (!sym)
-        sym = (void *)csoloader_elf_symb_address(img, symbol);
-
-      return sym;
-    }
-
-    return original_dlsym ? original_dlsym(handle, symbol) : NULL;
-  }
-
-  /* INFO: If a handle is shared between modules, this will not be able to find it.*/
-  static int custom_dlclose(void *handle) {
-    int (*original_dlclose)(void *) = (int (*)(void *))_linker_get_original_libdl_symbol("dlclose");
-
-    struct linker *linker = _linker_find_by_caller_address(__builtin_return_address(0));
-    if (linker && _linker_image_from_handle(linker, handle)) return 0;
-
-    return original_dlclose ? original_dlclose(handle) : -1;
-  }
-#endif /* CSOLOADER_MAKE_LINKER_HOOKS */
-
 /* INFO: Internal functions END */
 
 bool linker_init(struct linker *linker, struct csoloader_elf *img) {
@@ -514,8 +504,6 @@ bool linker_init(struct linker *linker, struct csoloader_elf *img) {
 
   memset(linker->dependencies, 0, sizeof(linker->dependencies));
 
-  _linker_register(linker);
-
   return true;
 }
 
@@ -525,8 +513,6 @@ static void _linker_run_dependency_destructors(struct loaded_dep *dep) {
   if (!dep->img || !dep->is_manual_load) return;
 
   _linker_call_destructors(dep->img);
-  unregister_eh_frame_for_library(dep->img);
-  unregister_custom_library_for_backtrace(dep->img);
 }
 
 static void _linker_release_dependency(struct linker *linker, int index, bool unload) {
@@ -552,23 +538,53 @@ static void _linker_release_dependencies(struct linker *linker, bool unload, boo
     }
   }
 
+  for (int i = 0; i < linker->dep_count; i++) {
+    struct loaded_dep *dep = &linker->dependencies[i];
+    if (!dep->img || !dep->is_manual_load) continue;
+
+    unregister_eh_frame_for_library(dep->img);
+    unregister_custom_library_for_backtrace(dep->img);
+  }
+
   for (int i = linker->dep_count - 1; i >= 0; --i)
     _linker_release_dependency(linker, i, unload);
 }
 
-void linker_destroy(struct linker *linker) {
+bool linker_destroy(struct linker *linker) {
+  if (linker->is_linked) {
+    if (!custom_library_can_unload(linker->img)) {
+      LOGE("Cannot unload %s while libdl compatibility calls or handles are active",
+           linker->img->elf);
+
+      return false;
+    }
+
+    for (int i = 0; i < linker->dep_count; i++) {
+      struct loaded_dep *dep = &linker->dependencies[i];
+      if (!dep->img || !dep->is_manual_load
+          || custom_library_can_unload(dep->img))
+        continue;
+
+      LOGE("Cannot unload %s while libdl compatibility calls or handles are active",
+           dep->img->elf);
+
+      return false;
+    }
+  }
+
   void *main_base = linker->img->base;
   size_t main_map_size = linker->main_map_size;
 
   if (linker->is_linked) {
     _linker_call_destructors(linker->img);
-    unregister_eh_frame_for_library(linker->img);
-    unregister_custom_library_for_backtrace(linker->img);
   }
   
   _linker_release_dependencies(linker, true, linker->is_linked);
 
-  _linker_unregister(linker);
+  if (linker->img) {
+    unregister_eh_frame_for_library(linker->img);
+    unregister_custom_library_for_backtrace(linker->img);
+  }
 
   _linker_unregister_tls_segment((struct loaded_dep *)linker);
   csoloader_elf_destroy(linker->img);
@@ -580,18 +596,18 @@ void linker_destroy(struct linker *linker) {
   linker->dep_count = 0;
   linker->is_linked = false;
   linker->main_map_size = 0;
+
+  return true;
 }
 
 /* INFO: Free resources related to the library without unloading it */
 void linker_abandon(struct linker *linker) {
   _linker_release_dependencies(linker, false, false);
 
-  if (linker->img && linker->is_linked) {
+  if (linker->img) {
     unregister_eh_frame_for_library(linker->img);
     unregister_custom_library_for_backtrace(linker->img);
   }
-
-  _linker_unregister(linker);
 
   _linker_unregister_tls_segment((struct loaded_dep *)linker);
   csoloader_elf_destroy(linker->img);
@@ -856,6 +872,100 @@ static struct linker_symbol_info _linker_find_symbol_in_linker_scope(struct link
     .img = NULL,
     .tls_indices = NULL
   };
+}
+
+void *linker_dlsym_default(struct linker *linker, const char *symbol) {
+  if (!linker || !linker->img || !symbol) return NULL;
+
+  void *address =
+    (void *)csoloader_elf_symb_address_exported(linker->img, symbol);
+  if (address) return address;
+
+  for (int i = 0; i < linker->dep_count; i++) {
+    struct loaded_dep *candidate = &linker->dependencies[i];
+    if (!candidate->img) continue;
+
+    address =
+      (void *)csoloader_elf_symb_address_exported(candidate->img, symbol);
+    if (address) return address;
+  }
+
+  return NULL;
+}
+
+void *linker_dlsym_handle(struct linker *linker,
+                          struct csoloader_elf *requester,
+                          const char *symbol) {
+  if (!linker || !linker->img || !requester || !symbol) return NULL;
+
+  void *address =
+    (void *)csoloader_elf_symb_address_exported(requester, symbol);
+  if (address) return address;
+  if (requester == linker->img)
+    return linker_dlsym_default(linker, symbol);
+
+  if (!requester->strtab_start) return NULL;
+
+  ElfW(Phdr) *phdr =
+    (ElfW(Phdr) *)((uintptr_t)requester->header + requester->header->e_phoff);
+  for (int i = 0; i < requester->header->e_phnum; i++) {
+    if (phdr[i].p_type != PT_DYNAMIC) continue;
+
+    ElfW(Dyn) *dyn =
+      (ElfW(Dyn) *)((uintptr_t)requester->base
+                    + phdr[i].p_vaddr
+                    - requester->bias);
+    for (ElfW(Dyn) *entry = dyn;
+         entry && entry->d_tag != DT_NULL;
+         entry++) {
+      if (entry->d_tag != DT_NEEDED) continue;
+
+      const char *needed =
+        (const char *)requester->strtab_start + entry->d_un.d_val;
+      for (int j = 0; j < linker->dep_count; j++) {
+        struct loaded_dep *candidate = &linker->dependencies[j];
+        if (!candidate->img
+            || strcmp(_path_basename(candidate->img->elf),
+                      _path_basename(needed)) != 0)
+          continue;
+
+        address = (void *)csoloader_elf_symb_address_exported(
+          candidate->img, symbol);
+        if (address) return address;
+      }
+    }
+  }
+
+  return NULL;
+}
+
+void *linker_dlsym_next(struct linker *linker,
+                        struct csoloader_elf *requester,
+                        const char *symbol) {
+  if (!linker || !linker->img || !requester || !symbol) return NULL;
+
+  int first_dependency = 0;
+  if (requester != linker->img) {
+    first_dependency = -1;
+    for (int i = 0; i < linker->dep_count; i++) {
+      if (linker->dependencies[i].img != requester) continue;
+
+      first_dependency = i + 1;
+      break;
+    }
+    if (first_dependency < 0) return NULL;
+  }
+
+  for (int i = first_dependency; i < linker->dep_count; i++) {
+    struct loaded_dep *candidate = &linker->dependencies[i];
+    if (!candidate->img) continue;
+
+    void *address =
+      (void *)csoloader_elf_symb_address_exported(candidate->img, symbol);
+    if (address) return address;
+  }
+
+  return NULL;
 }
 
 #ifdef __aarch64__
@@ -1354,49 +1464,48 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
                  library loaded by it calls any of those functions (with the macro defined), it will try
                  to call an address that is no longer valid, resulting in an undefined behavior, which
                  most of the time, in most devices, will result in a segmentation fault. */
-      #if defined(CSOLOADER_MAKE_LINKER_HOOKS) || defined(CSOLOADER_HOOK_DLADDR)
+      #if defined(CSOLOADER_MAKE_LINKER_HOOKS) \
+          || defined(CSOLOADER_HOOK_LIBDL) \
+          || defined(CSOLOADER_HOOK_DLADDR)
         if (strcmp(sym_name, "dladdr") == 0) {
           LOGD("Special case for dladdr: using custom implementation");
 
-          *target_addr = (ElfW(Addr))custom_dladdr;
-
-          return true;
+          sym.addr = (void *)custom_dladdr;
         }
-      #endif /* CSOLOADER_MAKE_LINKER_HOOKS || CSOLOADER_HOOK_DLADDR */
+      #endif
 
-      #ifdef CSOLOADER_MAKE_LINKER_HOOKS
+      #if defined(CSOLOADER_MAKE_LINKER_HOOKS) \
+          || defined(CSOLOADER_HOOK_LIBDL)
         if (strcmp(sym_name, "dl_iterate_phdr") == 0) {
           LOGD("Special case for dl_iterate_phdr: using custom implementation");
 
-          *target_addr = (ElfW(Addr))custom_dl_iterate_phdr;
-
-          return true;
+          sym.addr = (void *)custom_dl_iterate_phdr;
         }
 
         if (strcmp(sym_name, "dlopen") == 0) {
           LOGD("Special case for dlopen: using custom implementation");
 
-          *target_addr = (ElfW(Addr))custom_dlopen;
-
-          return true;
+          sym.addr = (void *)custom_dlopen;
         }
 
         if (strcmp(sym_name, "dlsym") == 0) {
           LOGD("Special case for dlsym: using custom implementation");
 
-          *target_addr = (ElfW(Addr))custom_dlsym;
+          sym.addr = (void *)custom_dlsym;
+        }
 
-          return true;
+        if (strcmp(sym_name, "dlerror") == 0) {
+          LOGD("Special case for dlerror: using custom implementation");
+
+          sym.addr = (void *)custom_dlerror;
         }
 
         if (strcmp(sym_name, "dlclose") == 0) {
           LOGD("Special case for dlclose: using custom implementation");
 
-          *target_addr = (ElfW(Addr))custom_dlclose;
-
-          return true;
+          sym.addr = (void *)custom_dlclose;
         }
-      #endif /* CSOLOADER_MAKE_LINKER_HOOKS */
+      #endif
 
       /* INFO: While the comment for other hooks is still valid for this one, it is a critical
                  component of the TLS system from CSOLoader, and if not hooked, will also result
@@ -1405,9 +1514,7 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
       if (strcmp(sym_name, "__tls_get_addr") == 0) {
         LOGD("Special case for __tls_get_addr: using custom TLS implementation");
 
-        *target_addr = (ElfW(Addr))__tls_get_addr;
-
-        return true;
+        sym.addr = (void *)__tls_get_addr;
       }
 
       switch (r->type) {
@@ -1430,16 +1537,35 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
         }
         #ifdef __x86_64__
         case R_X86_64_32: {
-          *target_addr = (ElfW(Addr))sym.addr + r->r_addend;
+          uint64_t value = (uint64_t)(ElfW(Addr))sym.addr + r->r_addend;
+          if (value > UINT32_MAX) {
+            LOGE("R_X86_64_32 relocation overflow for '%s' in %s",
+                 sym_name, dep->img->elf);
 
-          LOGD("R_X86_64_32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, dep->img->elf, sym_name, (void *)*target_addr);
+            return false;
+          }
+
+          *(uint32_t *)target_addr = (uint32_t)value;
+
+          LOGD("R_X86_64_32 relocation at %p in %s: symbol '%s' resolved to 0x%x", target_addr, dep->img->elf, sym_name, *(uint32_t *)target_addr);
 
           break;
         }
         case R_X86_64_PC32: {
-          *target_addr = (ElfW(Addr))sym.addr + r->r_addend - (ElfW(Addr))target_addr;
+          int64_t value =
+            (int64_t)(ElfW(Addr))sym.addr
+            + r->r_addend
+            - (int64_t)(ElfW(Addr))target_addr;
+          if (value < INT32_MIN || value > INT32_MAX) {
+            LOGE("R_X86_64_PC32 relocation overflow for '%s' in %s",
+                 sym_name, dep->img->elf);
 
-          LOGD("R_X86_64_PC32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, dep->img->elf, sym_name, (void *)*target_addr);
+            return false;
+          }
+
+          *(int32_t *)target_addr = (int32_t)value;
+
+          LOGD("R_X86_64_PC32 relocation at %p in %s: symbol '%s' resolved to 0x%x", target_addr, dep->img->elf, sym_name, *(uint32_t *)target_addr);
 
           break;
         }
@@ -2278,7 +2404,26 @@ bool linker_link(struct linker *linker) {
     }
   }
 
-  if (!register_custom_library_for_backtrace(linker->img))
+  csoloader_mapped_range_entry mapped_range_entry = NULL;
+  if (linker->use_mapped_range_entry) {
+    if (!linker->img->init_array || linker->img->init_array_count == 0) {
+      LOGE("Mapped-range load requires a final .init_array wrapper");
+
+      return false;
+    }
+
+    void (*wrapper)(int, char **, char **) =
+      linker->img->init_array[linker->img->init_array_count - 1];
+    mapped_range_entry =
+      _linker_decode_mapped_range_entry(linker, wrapper);
+    if (!mapped_range_entry) {
+      LOGE("Failed to validate the mapped-range entry wrapper at %p", wrapper);
+
+      return false;
+    }
+  }
+
+  if (!register_custom_library_for_backtrace(linker->img, linker, 0))
     LOGW("Failed to register main library for backtrace support");
 
   register_eh_frame_for_library(linker->img);
@@ -2287,7 +2432,7 @@ bool linker_link(struct linker *linker) {
     struct loaded_dep *dep = &linker->dependencies[i];
     if (!dep->is_manual_load) continue;
 
-    if (!register_custom_library_for_backtrace(dep->img)) {
+    if (!register_custom_library_for_backtrace(dep->img, linker, (size_t)i + 1)) {
       LOGW("Failed to register dependency %s for backtrace support", dep->img->elf);
     }
 
@@ -2316,7 +2461,12 @@ bool linker_link(struct linker *linker) {
     constructor_state[i] = 2;
   }
 
-  _linker_call_constructors(linker->img);
+  if (linker->use_mapped_range_entry) {
+    if (!_linker_call_mapped_range_constructors(linker, mapped_range_entry))
+      return false;
+  } else {
+    _linker_call_constructors(linker->img);
+  }
 
   linker->is_linked = true;
 

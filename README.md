@@ -38,13 +38,25 @@ Gadget filename does not appear on those lines in `/proc/<pid>/maps`. This
 integration is not ReZygisk's `ptrace`/monitor/`remote_csoloader` architecture;
 ReZygisk is used only as a reference source.
 
-The unsafe optional libdl/PHDR hook group remains disabled. Only `dladdr` calls
-originating in the custom-linked image are redirected so Gadget can resolve its
-logical library path for adjacent configuration discovery. `dl_iterate_phdr`,
-`dlopen`, `dlsym`, and `dlclose` continue to use the Android system linker.
+The unsafe process-wide libdl/PHDR hook group remains disabled. During
+relocation, only Gadget and its custom-linked dependencies have their
+`dl_iterate_phdr`, `dladdr`, `dlopen`, `dlsym`, `dlerror`, and `dlclose`
+imports redirected to a local compatibility layer. It supplies synthetic PHDR
+and address information for anonymous images, stable handles for Gadget and
+its custom-linked dependencies, and thread-local error reporting. A `dlopen`
+request for any other library is forwarded to the Android system linker, and
+system handles remain system handles. The rest of the process is unaffected.
+
+On Android, Frida's internal module enumeration reads the system linker's
+private module list and cannot see a custom-linked image. The Gadget-specific
+load path therefore validates its final per-ABI constructor wrapper and invokes
+the wrapped entry with the anonymous mapping range and config JSON explicitly.
+Ordinary libraries loaded through `csoloader_load` keep their normal constructor
+behavior; an unknown Gadget wrapper is rejected instead of being called.
+
 CSOLoader's required `__tls_get_addr` hook and its constructor/relocation
 handling remain active. The loader remains resident for the life of the process
-so its TLS and mapping state stays valid.
+so its TLS, compatibility handles, and mapping state stay valid.
 
 Loading is strict: if CSOLoader fails, there is no fallback path. The Zygisk
 module and CSOLoader state remain resident in the target process. Failed loads
